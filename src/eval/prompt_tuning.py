@@ -122,7 +122,7 @@ def run_prompt_search(data_dir, output_dir, device):
         )
         text_dir = F.normalize(anom_texts - normal_texts, dim=-1)
 
-        alignments = (text_dir * img_dir).sum(dim=1).cpu().numpy()
+        alignments = (text_dir * img_dir.to(text_dir.device)).sum(dim=1).cpu().numpy()
         alignment_matrix[:, ci] = alignments
 
         best_idx = int(alignments.argmax())
