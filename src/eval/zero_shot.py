@@ -55,7 +55,11 @@ def build_memory_bank(clip_model, data_dir, category, device):
 
 def build_test_loader(data_dir, category):
     tf = build_transform()
-    ds = MVTecDataset(data_dir, category, split="test", transform=tf)
+    mtf = transforms.Compose([
+        transforms.Resize(IMG_SIZE, interpolation=transforms.InterpolationMode.NEAREST),
+        transforms.ToTensor(),
+    ])
+    ds = MVTecDataset(data_dir, category, split="test", transform=tf, mask_transform=mtf)
     return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False), len(ds)
 
 
