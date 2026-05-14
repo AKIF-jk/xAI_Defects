@@ -75,7 +75,13 @@ class MemoryBank:
                 gf = global_feats[i]
                 pf = patch_feats[i] if patch_feats is not None else None
                 feat = self._extract_feature(gf, pf)
-                self.index.add(feat.cpu().numpy().reshape(1, -1))
+                feat_np = feat.cpu().numpy().reshape(1, -1)
+                d = feat_np.shape[1]
+                if d != self.feat_dim:
+                    print(f"  [DIM MISMATCH] mode={self.mode} feat_dim={d} "
+                          f"expected={self.feat_dim} gf.shape={gf.shape} "
+                          f"pf.shape={pf.shape if pf is not None else None}")
+                self.index.add(feat_np)
 
                 if pf is not None:
                     self.patch_bank.append(pf[1:].cpu())
