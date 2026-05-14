@@ -84,12 +84,9 @@ def evaluate_category(clip_model, adapt_model, data_dir, category, device):
         scores = scores.detach().cpu()
         labels = labels.detach().cpu()
 
-        print(f"\n      batch {batch_idx}: images={images.shape} labels={labels.shape} scores={scores.shape}", end="")
-
         if scores.dim() == 2 and scores.shape[1] == 1:
             scores = scores.squeeze(1)
         elif scores.dim() == 2 and scores.shape[1] > 1:
-            print(f"  WARNING: scores has {scores.shape[1]} columns, taking mean", end="")
             scores = scores.mean(dim=1)
 
         all_scores.append(scores)

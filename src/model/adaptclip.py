@@ -107,18 +107,16 @@ class PromptQueryAdapter(nn.Module):
         B = query_feat.shape[0]
         N = memory_bank.shape[0]
 
-        q_exp = query_feat.unsqueeze(1).expand(-1, N, -1)
-        m_exp = memory_bank.unsqueeze(0).expand(B, -1, -1)
+        q_exp = query_feat.unsqueeze(1).expand(B, N, -1)
+        m_exp = memory_bank.unsqueeze(0).expand(B, N, -1)
         cat_feat = torch.cat([q_exp, m_exp], dim=-1)
 
         ctx = self.contextual(cat_feat)
 
-        res = torch.cdist(
-            query_feat.unsqueeze(1),
-            memory_bank.unsqueeze(0),
-            p=2.0,
-        )
-        res_dist = res.mean(dim=1, keepdim=True)
+        q_cdist = query_feat.unsqueeze(1)
+        m_cdist = memory_bank.unsqueeze(0).expand(B, -1, -1)
+        res = torch.cdist(q_cdist, m_cdist, p=2.0)
+        res_dist = res.squeeze(1).mean(dim=1, keepdim=True)
 
         score = torch.sigmoid(ctx.mean(dim=1) + res_dist * self.beta)
         return score
