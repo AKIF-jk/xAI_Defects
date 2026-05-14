@@ -49,6 +49,8 @@ class MemoryBank:
             if self._proj_matrix is not None:
                 patch_mean = patch_mean @ self._proj_matrix.to(patch_mean.device)
             concat = torch.cat([global_feat, patch_mean])
+            if self.proj.weight.device != concat.device:
+                self.proj = self.proj.to(concat.device)
             return self.proj(concat)
         else:
             return global_feat
@@ -63,6 +65,8 @@ class MemoryBank:
         self._proj_matrix = getattr(model.visual, "proj", None)
         if self._proj_matrix is not None and isinstance(self._proj_matrix, nn.Parameter):
             self._proj_matrix = self._proj_matrix.detach()
+        if self.proj is not None:
+            self.proj = self.proj.to(device)
 
         count = 0
         for batch in dataloader:
@@ -139,6 +143,8 @@ class MemoryBank:
             if self._proj_matrix is not None:
                 patch_mean = patch_mean @ self._proj_matrix.to(patch_mean.device)
             concat = torch.cat([global_feat, patch_mean], dim=-1)
+            if self.proj.weight.device != concat.device:
+                self.proj = self.proj.to(concat.device)
             feat = self.proj(concat)
         else:
             feat = global_feat
