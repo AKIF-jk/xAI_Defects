@@ -1,1 +1,16 @@
 /doc
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+venv/
+.venv/
+env/
+.DS_Store
+.ipynb_checkpoints/
+*.swp
+*.swo
+*~
