@@ -85,14 +85,16 @@ def test_score_maps(data_dir, output_dir, device):
         if len(anom_panel) == 3 and len(norm_panel) == 3:
             break
 
+    min_component_area = 50
+
     anom_results = []
     for img_tensor, mask_tensor in anom_panel:
-        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max)
+        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max, min_component_area)
         anom_results.append(r)
 
     norm_results = []
     for img_tensor, mask_tensor in norm_panel:
-        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max)
+        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max, min_component_area)
         norm_results.append(r)
 
     import matplotlib
@@ -152,7 +154,7 @@ def _capture_hook(model):
     return patch_features, handle
 
 
-def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max=None):
+def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max=None, min_component_area=0):
     img_tensor = img_tensor.to(device)
     orig_np = _denormalize(img_tensor[0]).permute(1, 2, 0).cpu().numpy()
 
@@ -183,7 +185,7 @@ def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, 
         if proj is not None:
             pb = pb @ proj.detach().to(pb.device)
     patch_scores = compute_patch_scores(query_patches, pb.to(query_patches.device))
-    heatmap = scores_to_heatmap(patch_scores, img_size=256, global_max=global_max)
+    heatmap = scores_to_heatmap(patch_scores, img_size=256, global_max=global_max, min_component_area=min_component_area)
     overlay_img = overlay_heatmap((orig_np * 255).astype(np.uint8), heatmap, alpha=0.5)
 
     hm_np = heatmap.squeeze().cpu().numpy()

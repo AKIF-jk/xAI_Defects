@@ -10,7 +10,7 @@ def compute_patch_scores(query_patch_features, memory_patch_bank):
     return patch_scores
 
 
-def scores_to_heatmap(patch_scores, img_size=256, patch_size=14, sigma=4.0, global_max=None):
+def scores_to_heatmap(patch_scores, img_size=256, patch_size=14, sigma=4.0, global_max=None, min_component_area=0):
     grid_size = int(patch_scores.shape[0] ** 0.5)
     heat = patch_scores.view(1, 1, grid_size, grid_size).float()
     upsampled = F.interpolate(heat, size=(img_size, img_size),
@@ -27,6 +27,9 @@ def scores_to_heatmap(patch_scores, img_size=256, patch_size=14, sigma=4.0, glob
         else:
             smoothed = torch.zeros_like(smoothed)
 
+    if min_component_area > 0:
+        smoothed = _filter_small_components(smoothed, min_component_area)
+
     return smoothed.squeeze(0)
 
 
@@ -40,6 +43,19 @@ def _gaussian_kernel(sigma, size=None, device="cpu"):
     kernel = gauss[:, None] * gauss[None, :]
     kernel = kernel / kernel.sum()
     return kernel.view(1, 1, size, size)
+
+
+def _filter_small_components(heatmap, min_area, intensity_threshold=0.3):
+    from skimage.measure import label
+
+    hm = heatmap.squeeze().cpu().numpy()
+    binary = hm > intensity_threshold
+    labeled = label(binary)
+    for i in range(1, labeled.max() + 1):
+        mask = labeled == i
+        if mask.sum() < min_area:
+            hm[mask] = 0.0
+    return torch.from_numpy(hm).to(heatmap.device).unsqueeze(0).unsqueeze(0)
 
 
 def overlay_heatmap(original_img, heatmap, alpha=0.5, colormap="jet"):
