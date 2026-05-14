@@ -70,7 +70,12 @@ def compute_image_centroids(data_dir, category, clip_model, device):
         normal_feats.append(feats.cpu())
     normal_mean = torch.cat(normal_feats).mean(dim=0)
 
-    test_ds = MVTecDataset(data_dir, category, split="test", transform=tf)
+    test_ds = MVTecDataset(data_dir, category, split="test",
+                           transform=tf,
+                           mask_transform=transforms.Compose([
+                               transforms.Resize(224, interpolation=transforms.InterpolationMode.NEAREST),
+                               transforms.ToTensor(),
+                           ]))
     test_loader = DataLoader(test_ds, batch_size=32, shuffle=False)
 
     anom_feats = []
