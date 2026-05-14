@@ -4,6 +4,7 @@ import sys
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -38,11 +39,38 @@ def test_score_maps(data_dir, output_dir, device):
                             ]))
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
 
-    print("Building memory bank (4-shot)...")
+    print("Building memory bank (8-shot)...")
     bank = MemoryBank(feat_dim=768, mode="global")
-    bank.build(clip_model, train_loader, 4, device)
+    bank.build(clip_model, train_loader, 8, device)
     patch_bank = bank.get_patch_bank()
     print(f"  Memory bank: {bank.size} images, patch bank: {patch_bank.shape}")
+
+    print("Computing global_max from training images...")
+    normal_scores = []
+    for batch in train_loader:
+        img_tensor, _ = batch
+        img_tensor = img_tensor.to(device)
+        pf_hook, handle = _capture_hook(clip_model)
+        with torch.no_grad():
+            _ = clip_model.encode_image(img_tensor)
+        patch_feats_all = pf_hook[0]
+        handle.remove()
+        if patch_feats_all is not None:
+            if patch_feats_all.shape[-1] == 1024:
+                proj = getattr(clip_model.visual, "proj", None)
+                if proj is not None:
+                    patch_feats_all = patch_feats_all @ proj.detach().to(patch_feats_all.device)
+            query_patches = patch_feats_all[0, 1:, :]
+            pb = patch_bank
+            if pb.shape[1] != query_patches.shape[1]:
+                proj = getattr(clip_model.visual, "proj", None)
+                if proj is not None:
+                    pb = pb @ proj.detach().to(pb.device)
+            ps = compute_patch_scores(query_patches, pb.to(query_patches.device))
+            normal_scores.append(ps.cpu().numpy())
+    all_scores = np.concatenate(normal_scores)
+    global_max = np.percentile(all_scores, 95)
+    print(f"  global_max (95th percentile of train patch distances) = {global_max:.4f}")
 
     anom_panel = []
     norm_panel = []
@@ -59,12 +87,12 @@ def test_score_maps(data_dir, output_dir, device):
 
     anom_results = []
     for img_tensor, mask_tensor in anom_panel:
-        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device)
+        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max)
         anom_results.append(r)
 
     norm_results = []
     for img_tensor, mask_tensor in norm_panel:
-        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device)
+        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max)
         norm_results.append(r)
 
     import matplotlib
@@ -101,7 +129,7 @@ def test_score_maps(data_dir, output_dir, device):
                 ax_mask.set_title(f"{label} #{col+1}: No GT")
             ax_mask.axis("off")
 
-    plt.suptitle("Bottle: Score Maps (4-shot memory bank)", fontsize=16)
+    plt.suptitle("Bottle: Score Maps (8-shot memory bank, global norm)", fontsize=16)
     plt.tight_layout()
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, "bottle_score_maps_test.png")
@@ -124,7 +152,7 @@ def _capture_hook(model):
     return patch_features, handle
 
 
-def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device):
+def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max=None):
     img_tensor = img_tensor.to(device)
     orig_np = _denormalize(img_tensor[0]).permute(1, 2, 0).cpu().numpy()
 
@@ -155,7 +183,7 @@ def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device):
         if proj is not None:
             pb = pb @ proj.detach().to(pb.device)
     patch_scores = compute_patch_scores(query_patches, pb.to(query_patches.device))
-    heatmap = scores_to_heatmap(patch_scores, img_size=256)
+    heatmap = scores_to_heatmap(patch_scores, img_size=256, global_max=global_max)
     overlay_img = overlay_heatmap((orig_np * 255).astype(np.uint8), heatmap, alpha=0.5)
 
     hm_np = heatmap.squeeze().cpu().numpy()

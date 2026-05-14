@@ -10,7 +10,7 @@ def compute_patch_scores(query_patch_features, memory_patch_bank):
     return patch_scores
 
 
-def scores_to_heatmap(patch_scores, img_size=256, patch_size=14, sigma=4.0):
+def scores_to_heatmap(patch_scores, img_size=256, patch_size=14, sigma=4.0, global_max=None):
     grid_size = int(patch_scores.shape[0] ** 0.5)
     heat = patch_scores.view(1, 1, grid_size, grid_size).float()
     upsampled = F.interpolate(heat, size=(img_size, img_size),
@@ -18,11 +18,14 @@ def scores_to_heatmap(patch_scores, img_size=256, patch_size=14, sigma=4.0):
     kernel = _gaussian_kernel(sigma, device=upsampled.device)
     smoothed = F.conv2d(upsampled, kernel, padding=kernel.shape[-1] // 2)
 
-    lo, hi = smoothed.min(), smoothed.max()
-    if hi > lo:
-        smoothed = (smoothed - lo) / (hi - lo)
+    if global_max is not None:
+        smoothed = torch.clamp(smoothed / global_max, 0, 1)
     else:
-        smoothed = torch.zeros_like(smoothed)
+        lo, hi = smoothed.min(), smoothed.max()
+        if hi > lo:
+            smoothed = (smoothed - lo) / (hi - lo)
+        else:
+            smoothed = torch.zeros_like(smoothed)
 
     return smoothed.squeeze(0)
 

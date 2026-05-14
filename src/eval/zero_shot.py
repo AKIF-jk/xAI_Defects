@@ -24,7 +24,7 @@ CATEGORIES = [
 
 IMG_SIZE = 224
 BATCH_SIZE = 32
-N_SHOT = 4
+N_SHOT = 8
 
 
 def build_transform():

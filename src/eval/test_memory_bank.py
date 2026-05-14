@@ -49,7 +49,7 @@ def test_memory_bank(data_dir, output_dir, device):
             break
 
     modes = ["global", "patch", "hybrid"]
-    n_shot_values = [1, 2, 4]
+    n_shot_values = [1, 2, 4, 8]
     all_results = {}
 
     for mode in modes:
