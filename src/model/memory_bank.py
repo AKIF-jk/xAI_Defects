@@ -89,7 +89,7 @@ class MemoryBank:
                 gf = global_feats[i]
                 pf = patch_feats[i] if patch_feats is not None else None
                 feat = self._extract_feature(gf, pf)
-                feat_np = feat.cpu().numpy().reshape(1, -1)
+                feat_np = feat.detach().cpu().numpy().reshape(1, -1)
                 self.index.add(feat_np)
 
                 if pf is not None:
@@ -102,7 +102,7 @@ class MemoryBank:
 
     def query(self, query_feat, k=1):
         if isinstance(query_feat, torch.Tensor):
-            query_feat = query_feat.cpu().numpy()
+            query_feat = query_feat.detach().cpu().numpy()
         if query_feat.ndim == 1:
             query_feat = query_feat.reshape(1, -1)
         distances, indices = self.index.search(query_feat, k)
