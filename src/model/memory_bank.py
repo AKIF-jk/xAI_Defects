@@ -18,6 +18,7 @@ class MemoryBank:
             self.proj = nn.Linear(feat_dim * 2, feat_dim)
         else:
             self.proj = None
+        self._proj_matrix = None
 
     def _register_hook(self, model):
         target = getattr(model.visual, "ln_post", None)
@@ -39,9 +40,14 @@ class MemoryBank:
             return global_feat
         elif self.mode == "patch":
             patch_tokens = patch_feats[1:]
-            return patch_tokens.mean(dim=0)
+            feat = patch_tokens.mean(dim=0)
+            if self._proj_matrix is not None:
+                feat = feat @ self._proj_matrix.to(feat.device)
+            return feat
         elif self.mode == "hybrid":
             patch_mean = patch_feats[1:].mean(dim=0)
+            if self._proj_matrix is not None:
+                patch_mean = patch_mean @ self._proj_matrix.to(patch_mean.device)
             concat = torch.cat([global_feat, patch_mean])
             return self.proj(concat)
         else:
@@ -53,6 +59,10 @@ class MemoryBank:
         self._patch_features = None
         self._n_stored = 0
         self._register_hook(model)
+
+        self._proj_matrix = getattr(model.visual, "proj", None)
+        if self._proj_matrix is not None and isinstance(self._proj_matrix, nn.Parameter):
+            self._proj_matrix = self._proj_matrix.detach()
 
         count = 0
         for batch in dataloader:
@@ -76,11 +86,6 @@ class MemoryBank:
                 pf = patch_feats[i] if patch_feats is not None else None
                 feat = self._extract_feature(gf, pf)
                 feat_np = feat.cpu().numpy().reshape(1, -1)
-                d = feat_np.shape[1]
-                if d != self.feat_dim:
-                    print(f"  [DIM MISMATCH] mode={self.mode} feat_dim={d} "
-                          f"expected={self.feat_dim} gf.shape={gf.shape} "
-                          f"pf.shape={pf.shape if pf is not None else None}")
                 self.index.add(feat_np)
 
                 if pf is not None:
@@ -125,9 +130,14 @@ class MemoryBank:
         if self.mode == "global":
             feat = global_feat
         elif self.mode == "patch":
-            feat = patch_feats[:, 1:, :].mean(dim=1)
+            patch_mean = patch_feats[:, 1:, :].mean(dim=1)
+            if self._proj_matrix is not None:
+                patch_mean = patch_mean @ self._proj_matrix.to(patch_mean.device)
+            feat = patch_mean
         elif self.mode == "hybrid":
             patch_mean = patch_feats[:, 1:, :].mean(dim=1)
+            if self._proj_matrix is not None:
+                patch_mean = patch_mean @ self._proj_matrix.to(patch_mean.device)
             concat = torch.cat([global_feat, patch_mean], dim=-1)
             feat = self.proj(concat)
         else:
