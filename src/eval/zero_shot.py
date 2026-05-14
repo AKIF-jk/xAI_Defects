@@ -81,11 +81,21 @@ def evaluate_category(clip_model, adapt_model, data_dir, category, device):
 
         with torch.no_grad():
             scores, _ = adapt_model(images, memory_bank, category)
-        all_scores.append(scores.cpu())
-        all_labels.append(labels.cpu())
+        scores = scores.detach().cpu()
+        labels = labels.detach().cpu()
 
-    all_scores = torch.cat(all_scores).numpy().ravel()
-    all_labels = torch.cat(all_labels).numpy().ravel()
+        if scores.dim() == 2 and scores.shape[1] == 1:
+            scores = scores.squeeze(1)
+        elif scores.dim() == 2 and scores.shape[1] > 1:
+            scores = scores.mean(dim=1)
+
+        all_scores.append(scores)
+        all_labels.append(labels)
+
+    all_scores = torch.cat([s.view(-1) for s in all_scores]).numpy()
+    all_labels = torch.cat([l.view(-1) for l in all_labels]).numpy()
+
+    print(f"    shapes: labels={all_labels.shape} scores={all_scores.shape}", end="")
 
     if len(np.unique(all_labels)) < 2:
         auroc = float("nan")
