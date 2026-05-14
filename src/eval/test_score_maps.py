@@ -149,7 +149,12 @@ def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device):
             patch_feats_all = patch_feats_all @ proj.detach().to(patch_feats_all.device)
 
     query_patches = patch_feats_all[0, 1:, :]
-    patch_scores = compute_patch_scores(query_patches, patch_bank.to(query_patches.device))
+    pb = patch_bank
+    if pb.shape[1] != query_patches.shape[1]:
+        proj = getattr(clip_model.visual, "proj", None)
+        if proj is not None:
+            pb = pb @ proj.detach().to(pb.device)
+    patch_scores = compute_patch_scores(query_patches, pb.to(query_patches.device))
     heatmap = scores_to_heatmap(patch_scores, img_size=256)
     overlay_img = overlay_heatmap((orig_np * 255).astype(np.uint8), heatmap, alpha=0.5)
 
@@ -163,8 +168,9 @@ def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device):
 
 
 def _denormalize(tensor):
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    device = tensor.device
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
     return torch.clamp(tensor * std + mean, 0, 1)
 
 
