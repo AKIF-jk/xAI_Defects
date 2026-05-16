@@ -131,13 +131,30 @@ class CLIPGradCAM:
     def _score_tensor(self, image_tensor, memory_bank, class_name):
         del class_name
         global_feat = self.clip_model.encode_image(image_tensor)
-        adapted = self.model.visual_adapter(global_feat)
-        score = self.model.prompt_query_adapter(adapted, memory_bank)
-        # PromptQueryAdapter is used as an anomaly score throughout evaluation:
-        # larger memory-bank distance increases the score, and label=1 is the
-        # positive class for AUROC. Keep that direction for Grad-CAM; negating it
-        # turns anomaly evidence negative and the final ReLU erases the map.
+        score = self._memory_distance_score(global_feat, memory_bank)
+        # Use a direct memory-bank anomaly objective for Grad-CAM. The
+        # PromptQueryAdapter head is randomly initialized in this repo and wraps
+        # its output in sigmoid, which can saturate and produce near-zero
+        # gradients. Nearest-normal squared distance stays differentiable and
+        # matches the memory bank features built from clip_model.encode_image().
         return score.view(image_tensor.shape[0], -1)
+
+    @staticmethod
+    def _memory_distance_score(query_feat, memory_bank, top_k=3):
+        if memory_bank.dim() == 1:
+            memory_bank = memory_bank.unsqueeze(0)
+
+        if query_feat.shape[-1] != memory_bank.shape[-1]:
+            raise RuntimeError(
+                "Grad-CAM memory bank feature dim does not match image feature dim: "
+                f"{memory_bank.shape[-1]} vs {query_feat.shape[-1]}"
+            )
+
+        k = min(max(int(top_k), 1), memory_bank.shape[0])
+        diff = query_feat.float().unsqueeze(1) - memory_bank.float().unsqueeze(0)
+        distances = diff.square().mean(dim=-1)
+        nearest = distances.topk(k, dim=1, largest=False).values
+        return nearest.mean(dim=1, keepdim=True)
 
     def _patch_anomaly_score_tensor(self, image_tensor, memory_bank):
         # NOTE: Only used when score_mode="patch" is explicitly requested.
