@@ -4,7 +4,6 @@ import sys
 
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -15,7 +14,7 @@ from model.memory_bank import MemoryBank
 from model.score_map import compute_patch_scores, scores_to_heatmap, overlay_heatmap
 
 
-def test_score_maps(data_dir, output_dir, device):
+def test_score_maps(data_dir, output_dir, device, category="bottle"):
     print("Loading CLIP backbone...")
     clip_model, _, _, device = load_backbone(device)
     clip_model.eval()
@@ -28,10 +27,10 @@ def test_score_maps(data_dir, output_dir, device):
                              std=[0.229, 0.224, 0.225]),
     ])
 
-    train_ds = MVTecDataset(data_dir, "leather", split="train", transform=tf)
+    train_ds = MVTecDataset(data_dir, category, split="train", transform=tf)
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
 
-    test_ds = MVTecDataset(data_dir, "leather", split="test",
+    test_ds = MVTecDataset(data_dir, category, split="test",
                             transform=tf,
                             mask_transform=transforms.Compose([
                                 transforms.Resize(224, interpolation=transforms.InterpolationMode.NEAREST),
@@ -53,6 +52,8 @@ def test_score_maps(data_dir, output_dir, device):
         if ps is not None:
             normal_scores.append(ps.cpu().numpy())
 
+    normal_center, normal_scale = _build_patch_calibration(normal_scores)
+
     print("Building panels and sampling anomalous scores...")
     anom_panel = []
     norm_panel = []
@@ -73,16 +74,24 @@ def test_score_maps(data_dir, output_dir, device):
         if len(anom_panel) == 3 and len(norm_panel) == 3:
             break
 
-    all_normal = np.concatenate(normal_scores)
-    global_max = np.percentile(all_normal, 99)
+    normal_z_scores = [
+        _calibrate_patch_scores_array(s, normal_center, normal_scale)
+        for s in normal_scores
+    ]
+    all_normal = np.concatenate(normal_z_scores)
+    global_max = max(float(np.percentile(all_normal, 99)), 1.0)
     print(f"  normal 50th pct: {np.percentile(all_normal, 50):.4f}")
     print(f"  normal 95th pct: {np.percentile(all_normal, 95):.4f}")
-    print(f"  global_max (normal 99th pct): {global_max:.4f}")
+    print(f"  global_max (normal calibrated 99th pct): {global_max:.4f}")
 
     if anomalous_scores:
-        anom_maxes = [s.max() for s in anomalous_scores]
+        anom_z_scores = [
+            _calibrate_patch_scores_array(s, normal_center, normal_scale)
+            for s in anomalous_scores
+        ]
+        anom_maxes = [s.max() for s in anom_z_scores]
         print(
-            "  mean anomalous max patch score: "
+            "  mean anomalous max calibrated patch score: "
             f"{np.mean(anom_maxes):.4f}  (should exceed global_max)"
         )
 
@@ -90,12 +99,34 @@ def test_score_maps(data_dir, output_dir, device):
 
     anom_results = []
     for img_tensor, mask_tensor in anom_panel:
-        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max, min_component_area)
+        r = _process_one(
+            clip_model,
+            bank,
+            patch_bank,
+            img_tensor,
+            mask_tensor,
+            device,
+            global_max,
+            min_component_area,
+            normal_center,
+            normal_scale,
+        )
         anom_results.append(r)
 
     norm_results = []
     for img_tensor, mask_tensor in norm_panel:
-        r = _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max, min_component_area)
+        r = _process_one(
+            clip_model,
+            bank,
+            patch_bank,
+            img_tensor,
+            mask_tensor,
+            device,
+            global_max,
+            min_component_area,
+            normal_center,
+            normal_scale,
+        )
         norm_results.append(r)
 
     import matplotlib
@@ -132,10 +163,10 @@ def test_score_maps(data_dir, output_dir, device):
                 ax_mask.set_title(f"{label} #{col+1}: No GT")
             ax_mask.axis("off")
 
-    plt.suptitle("Bottle: Score Maps (8-shot memory bank, global norm)", fontsize=16)
-    plt.tight_layout()
+    plt.suptitle(f"{category}: Score Maps (8-shot memory bank, calibrated residual)", fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
     os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, "bottle_score_maps_test.png")
+    path = os.path.join(output_dir, f"{category}_score_maps_test.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {path}")
@@ -179,7 +210,44 @@ def _extract_patch_scores(clip_model, img_tensor, patch_bank, device):
     return compute_patch_scores(query_patches, pb.to(query_patches.device))
 
 
-def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max=None, min_component_area=0):
+def _build_patch_calibration(normal_scores):
+    normal_matrix = np.stack(normal_scores).astype(np.float32)
+    center = np.median(normal_matrix, axis=0)
+    mad = np.median(np.abs(normal_matrix - center), axis=0)
+    scale = 1.4826 * mad
+
+    positive_scale = scale[scale > 0]
+    scale_floor = np.percentile(positive_scale, 10) if positive_scale.size else 1e-6
+    scale = np.maximum(scale, max(float(scale_floor), 1e-6))
+    return center, scale
+
+
+def _calibrate_patch_scores_array(scores, normal_center, normal_scale, baseline_quantile=0.5):
+    z = np.maximum((scores - normal_center) / normal_scale, 0.0)
+    baseline = np.quantile(z, baseline_quantile)
+    return np.maximum(z - baseline, 0.0)
+
+
+def _calibrate_patch_scores_tensor(patch_scores, normal_center, normal_scale, baseline_quantile=0.5):
+    center = torch.as_tensor(normal_center, device=patch_scores.device, dtype=patch_scores.dtype)
+    scale = torch.as_tensor(normal_scale, device=patch_scores.device, dtype=patch_scores.dtype)
+    z = torch.clamp((patch_scores - center) / scale, min=0.0)
+    baseline = torch.quantile(z, baseline_quantile)
+    return torch.clamp(z - baseline, min=0.0)
+
+
+def _process_one(
+    clip_model,
+    bank,
+    patch_bank,
+    img_tensor,
+    mask_tensor,
+    device,
+    global_max=None,
+    min_component_area=0,
+    normal_center=None,
+    normal_scale=None,
+):
     img_tensor = img_tensor.to(device)
     orig_np = _denormalize(img_tensor[0]).permute(1, 2, 0).cpu().numpy()
 
@@ -190,6 +258,13 @@ def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, 
     patch_scores = _extract_patch_scores(clip_model, img_tensor, patch_bank, device)
     if patch_scores is None:
         return orig_np, np.zeros((224, 224)), orig_np, mask_np
+
+    if normal_center is not None and normal_scale is not None:
+        patch_scores = _calibrate_patch_scores_tensor(
+            patch_scores,
+            normal_center,
+            normal_scale,
+        )
 
     heatmap = scores_to_heatmap(
         patch_scores,
@@ -219,8 +294,9 @@ def main():
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", default="./outputs/heatmaps")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--category", default="bottle")
     args = parser.parse_args()
-    test_score_maps(args.data_dir, args.output_dir, args.device)
+    test_score_maps(args.data_dir, args.output_dir, args.device, args.category)
 
 
 if __name__ == "__main__":
