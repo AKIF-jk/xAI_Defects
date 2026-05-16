@@ -39,12 +39,15 @@ class CLIPGradCAM:
         self._activation_handle = None
 
     def generate(self, image_tensor, memory_bank, class_name, img_size=256, score_mode="global"):
-        # FIX #2: Default score_mode changed from "patch" to "global".
-        # Using patch-sum as a scalar gives uniform gradients everywhere (no spatial signal).
-        # Global scoring produces a single meaningful logit that Captum can differentiate
-        # spatially through the visual transformer stack.
         self.model.eval()
-        self._memory_bank = self._as_memory_tensor(memory_bank, image_tensor.device)
+        score_mode = score_mode.lower()
+        if score_mode == "patch":
+            self._memory_bank = self._as_patch_memory_tensor(memory_bank, image_tensor.device)
+        elif score_mode == "global":
+            self._memory_bank = self._as_memory_tensor(memory_bank, image_tensor.device)
+        else:
+            raise ValueError(f"Unsupported Grad-CAM score_mode: {score_mode}")
+
         self._class_name = class_name
         self._score_mode = score_mode
 
@@ -121,9 +124,6 @@ class CLIPGradCAM:
         return weighted.detach().cpu().numpy()
 
     def _forward_score(self, image_tensor):
-        # FIX #2 (continued): "patch" mode is removed from this hot path.
-        # _patch_anomaly_score_tensor summed all patch scores into a single scalar,
-        # giving Captum no spatial gradient signal. Always use global scoring here.
         if getattr(self, "_score_mode", "global") == "global":
             return self._score_tensor(image_tensor, self._memory_bank, self._class_name)
         return self._patch_anomaly_score_tensor(image_tensor, self._memory_bank)
@@ -157,10 +157,9 @@ class CLIPGradCAM:
         return nearest.mean(dim=1, keepdim=True)
 
     def _patch_anomaly_score_tensor(self, image_tensor, memory_bank):
-        # NOTE: Only used when score_mode="patch" is explicitly requested.
-        # The memory_bank passed here should be a patch-level bank (mode="patch"),
-        # not a global one — mixing global memory with patch tokens yields
-        # meaningless cosine similarities (FIX #4).
+        # The memory bank passed here must contain patch-level normal features.
+        # We optimize the most anomalous 10% of patches instead of summing all
+        # patches, which would encourage a broad image-level attribution map.
         global_feat, patch_tokens = self._encode_image_and_patch_tokens(image_tensor)
         del global_feat
         if patch_tokens is None:
@@ -172,7 +171,8 @@ class CLIPGradCAM:
             metric="cosine",
             top_k=3,
         )
-        score = patch_scores.sum()
+        focus_k = max(1, patch_scores.numel() // 10)
+        score = patch_scores.topk(focus_k, largest=True).values.mean()
         return score.view(1, 1)
 
     def _encode_image_and_patch_tokens(self, image_tensor):
@@ -365,6 +365,17 @@ class CLIPGradCAM:
             raise ValueError("memory_bank is empty; Grad-CAM scoring needs at least one reference")
         return memory.float().to(device)
 
+    @staticmethod
+    def _as_patch_memory_tensor(memory_bank, device):
+        if hasattr(memory_bank, "get_patch_bank"):
+            memory = memory_bank.get_patch_bank()
+        else:
+            memory = CLIPGradCAM._as_memory_tensor(memory_bank, device)
+
+        if memory.numel() == 0:
+            raise ValueError("patch memory_bank is empty; patch Grad-CAM needs normal patch features")
+        return memory.float().to(device)
+
     @contextmanager
     def _temporarily_unfreeze(self, layer):
         params = list(layer.parameters())
@@ -378,7 +389,14 @@ class CLIPGradCAM:
                 param.requires_grad_(old_flag)
 
 
-def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
+def run_cable_demo(
+    data_dir,
+    output_dir,
+    device=None,
+    n_shots=4,
+    img_size=224,
+    threshold_percentile=95.0,
+):
     clip_model, _, _, device = load_backbone(device)
     adapt_model = AdaptCLIPModel(clip_model, device).to(device)
     adapt_model.eval()
@@ -427,9 +445,13 @@ def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
             break
 
         image_tensor = image_tensor.to(device)
-        # score_mode="global" is now the default in generate(), so this is explicit
-        # for clarity but not strictly required.
-        gradcam = xai.generate(image_tensor, memory_tensor, "cable", img_size=img_size, score_mode="global")
+        gradcam = xai.generate(
+            image_tensor,
+            memory,
+            "cable",
+            img_size=img_size,
+            score_mode="patch",
+        )
         scorecam = xai.generate_scorecam(image_tensor, memory_tensor, "cable", img_size=img_size)
 
         original = _denormalize(image_tensor[0]).permute(1, 2, 0).detach().cpu().numpy()
@@ -438,23 +460,23 @@ def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
         score_overlay = overlay_heatmap(original_u8, scorecam, alpha=0.5)
         mask = mask_tensor.squeeze().cpu().numpy() > 0.5
 
-        # FIX #5: Threshold replaced with a simple top-20% percentile cut.
-        # The original "mean + 2*std" formula on a near-zero map (mean ~0.02)
-        # produced a threshold so high that almost no pixel cleared it, making
-        # pred all-False and IoU = 0 by construction.
-        # np.percentile(gradcam, 80) selects the top 20% of pixels, which is a
-        # robust, distribution-agnostic way to identify high-activation regions.
-        threshold = float(np.percentile(gradcam, 80))
+        threshold = float(np.percentile(gradcam, threshold_percentile))
         pred = gradcam > threshold
         union = np.logical_or(pred, mask).sum()
         intersection = np.logical_and(pred, mask).sum()
         iou = float(intersection / union) if union > 0 else 0.0
         ious.append(iou)
 
+        mask_area = float(mask.mean())
+        pred_area = float(pred.mean())
+        max_iou_at_area = _max_iou_for_areas(mask_area, pred_area)
+
         print(
             f"sample {len(rows) + 1}: "
             f"gradcam min={gradcam.min():.4f} max={gradcam.max():.4f} "
-            f"mean={gradcam.mean():.4f} threshold={threshold:.4f} iou={iou:.4f}"
+            f"mean={gradcam.mean():.4f} threshold={threshold:.4f} "
+            f"mask_area={mask_area:.4f} pred_area={pred_area:.4f} "
+            f"iou={iou:.4f} max_iou@area={max_iou_at_area:.4f}"
         )
 
         rows.append((original_u8, grad_overlay, score_overlay, mask.astype(np.float32)))
@@ -463,7 +485,16 @@ def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
         raise RuntimeError("No anomalous cable images found for Grad-CAM demo")
 
     _save_comparison_panel(rows, ious, output_dir)
-    print(f"Average Grad-CAM IoU @ 80th-percentile threshold: {np.mean(ious):.4f}")
+    print(
+        "Average Grad-CAM IoU @ "
+        f"{threshold_percentile:g}th-percentile threshold: {np.mean(ious):.4f}"
+    )
+
+
+def _max_iou_for_areas(mask_area, pred_area):
+    if mask_area <= 0.0 or pred_area <= 0.0:
+        return 0.0
+    return min(mask_area, pred_area) / max(mask_area, pred_area)
 
 
 def _save_comparison_panel(rows, ious, output_dir):
@@ -505,6 +536,7 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--n_shots", type=int, default=4)
     parser.add_argument("--img_size", type=int, default=224)
+    parser.add_argument("--threshold_percentile", type=float, default=95.0)
     args = parser.parse_args()
 
     run_cable_demo(
@@ -513,6 +545,7 @@ def main():
         device=args.device,
         n_shots=args.n_shots,
         img_size=args.img_size,
+        threshold_percentile=args.threshold_percentile,
     )
 
 
