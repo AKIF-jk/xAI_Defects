@@ -137,7 +137,7 @@ class CLIPGradCAM:
             metric="cosine",
             top_k=3,
         )
-        score = torch.quantile(patch_scores, 0.95)
+        score = patch_scores.sum()
         return score.view(1, 1)
 
     def _encode_image_and_patch_tokens(self, image_tensor):
@@ -393,7 +393,8 @@ def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
         score_overlay = overlay_heatmap(original_u8, scorecam, alpha=0.5)
         mask = mask_tensor.squeeze().cpu().numpy() > 0.5
 
-        threshold = max(0.5, float(np.percentile(gradcam, 90)))
+        threshold = max(gradcam.mean() + 2 * gradcam.std(), float(np.percentile(gradcam, 90)))
+        threshold = max(threshold, 0.1)
         pred = gradcam >= threshold
         union = np.logical_or(pred, mask).sum()
         intersection = np.logical_and(pred, mask).sum()
