@@ -28,10 +28,10 @@ def test_score_maps(data_dir, output_dir, device):
                              std=[0.229, 0.224, 0.225]),
     ])
 
-    train_ds = MVTecDataset(data_dir, "bottle", split="train", transform=tf)
+    train_ds = MVTecDataset(data_dir, "leather", split="train", transform=tf)
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
 
-    test_ds = MVTecDataset(data_dir, "bottle", split="test",
+    test_ds = MVTecDataset(data_dir, "leather", split="test",
                             transform=tf,
                             mask_transform=transforms.Compose([
                                 transforms.Resize(224, interpolation=transforms.InterpolationMode.NEAREST),
@@ -191,13 +191,18 @@ def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, 
     if patch_scores is None:
         return orig_np, np.zeros((224, 224)), orig_np, mask_np
 
-    heatmap = scores_to_heatmap(patch_scores, img_size=256, global_max=global_max, min_component_area=min_component_area)
+    heatmap = scores_to_heatmap(
+        patch_scores,
+        img_size=224,
+        sigma=12.0,
+        global_max=global_max,
+        min_component_area=min_component_area,
+    )
     overlay_img = overlay_heatmap((orig_np * 255).astype(np.uint8), heatmap, alpha=0.5)
 
     hm_np = heatmap.squeeze().cpu().numpy()
-    hm_resized = np.array(Image.fromarray(hm_np).resize((224, 224), Image.BILINEAR))
 
-    return orig_np, hm_resized, overlay_img, mask_np
+    return orig_np, hm_np, overlay_img, mask_np
 
 
 def _denormalize(tensor):
