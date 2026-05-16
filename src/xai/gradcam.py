@@ -16,7 +16,7 @@ from data.mvtec_dataset import MVTecDataset
 from model.adaptclip import AdaptCLIPModel
 from model.backbone import load_backbone
 from model.memory_bank import MemoryBank
-from model.score_map import overlay_heatmap
+from model.score_map import compute_patch_scores, overlay_heatmap
 
 
 class CLIPGradCAM:
@@ -38,10 +38,11 @@ class CLIPGradCAM:
         self._last_activation = None
         self._activation_handle = None
 
-    def generate(self, image_tensor, memory_bank, class_name, img_size=256):
+    def generate(self, image_tensor, memory_bank, class_name, img_size=256, score_mode="patch"):
         self.model.eval()
         self._memory_bank = self._as_memory_tensor(memory_bank, image_tensor.device)
         self._class_name = class_name
+        self._score_mode = score_mode
 
         image_tensor = image_tensor.to(self._memory_bank.device)
         image_tensor = image_tensor.requires_grad_(True)
@@ -113,7 +114,9 @@ class CLIPGradCAM:
         return weighted.detach().cpu().numpy()
 
     def _forward_score(self, image_tensor):
-        return self._score_tensor(image_tensor, self._memory_bank, self._class_name)
+        if getattr(self, "_score_mode", "patch") == "global":
+            return self._score_tensor(image_tensor, self._memory_bank, self._class_name)
+        return self._patch_anomaly_score_tensor(image_tensor, self._memory_bank)
 
     def _score_tensor(self, image_tensor, memory_bank, class_name):
         del class_name
@@ -121,6 +124,50 @@ class CLIPGradCAM:
         adapted = self.model.visual_adapter(global_feat)
         score = self.model.prompt_query_adapter(adapted, memory_bank)
         return score.view(image_tensor.shape[0], -1)
+
+    def _patch_anomaly_score_tensor(self, image_tensor, memory_bank):
+        global_feat, patch_tokens = self._encode_image_and_patch_tokens(image_tensor)
+        del global_feat
+        if patch_tokens is None:
+            return self._score_tensor(image_tensor, memory_bank, None)
+
+        patch_scores = compute_patch_scores(
+            patch_tokens[0],
+            memory_bank.to(patch_tokens.device),
+            metric="cosine",
+            top_k=3,
+        )
+        score = torch.quantile(patch_scores, 0.95)
+        return score.view(1, 1)
+
+    def _encode_image_and_patch_tokens(self, image_tensor):
+        patch_tokens = [None]
+
+        def hook(module, inp, out):
+            del module, inp
+            patch_tokens[0] = self._standardize_layer_output(out)
+
+        target = getattr(self.clip_model.visual, "ln_post", None)
+        if target is None:
+            target = self.target_layer
+
+        handle = target.register_forward_hook(hook)
+        try:
+            global_feat = self.clip_model.encode_image(image_tensor)
+        finally:
+            handle.remove()
+
+        tokens = patch_tokens[0]
+        if tokens is None:
+            return global_feat, None
+
+        if tokens.shape[-1] != global_feat.shape[-1]:
+            proj = getattr(self.clip_model.visual, "proj", None)
+            if proj is not None and tokens.shape[-1] == proj.shape[0]:
+                tokens = tokens @ proj.detach().to(tokens.device)
+
+        tokens = self._drop_cls_token(tokens)
+        return global_feat, tokens
 
     def _forward_with_activation(self, image_tensor, memory_bank, class_name):
         self._last_activation = None
@@ -170,7 +217,7 @@ class CLIPGradCAM:
             mode="bilinear",
             align_corners=False,
         )
-        cam = self._normalize_tensor(F.relu(cam[0, 0]))
+        cam = self._normalize_signed_tensor(cam[0, 0])
         return cam.detach().cpu().numpy()
 
     def _attribution_to_token_scores(self, attribution):
@@ -254,6 +301,18 @@ class CLIPGradCAM:
         return tensor / denom
 
     @staticmethod
+    def _normalize_signed_tensor(tensor):
+        positive = F.relu(tensor)
+        if positive.max() > 1e-8:
+            return positive / positive.max()
+
+        negative = F.relu(-tensor)
+        if negative.max() > 1e-8:
+            return negative / negative.max()
+
+        return torch.zeros_like(tensor)
+
+    @staticmethod
     def _as_memory_tensor(memory_bank, device):
         if isinstance(memory_bank, torch.Tensor):
             memory = memory_bank
@@ -334,11 +393,18 @@ def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
         score_overlay = overlay_heatmap(original_u8, scorecam, alpha=0.5)
         mask = mask_tensor.squeeze().cpu().numpy() > 0.5
 
-        pred = gradcam > 0.5
+        threshold = max(0.5, float(np.percentile(gradcam, 90)))
+        pred = gradcam >= threshold
         union = np.logical_or(pred, mask).sum()
         intersection = np.logical_and(pred, mask).sum()
         iou = float(intersection / union) if union > 0 else 0.0
         ious.append(iou)
+
+        print(
+            f"sample {len(rows) + 1}: "
+            f"gradcam min={gradcam.min():.4f} max={gradcam.max():.4f} "
+            f"mean={gradcam.mean():.4f} threshold={threshold:.4f} iou={iou:.4f}"
+        )
 
         rows.append((original_u8, grad_overlay, score_overlay, mask.astype(np.float32)))
 
@@ -346,7 +412,7 @@ def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
         raise RuntimeError("No anomalous cable images found for Grad-CAM demo")
 
     _save_comparison_panel(rows, ious, output_dir)
-    print(f"Average Grad-CAM IoU @ 0.5: {np.mean(ious):.4f}")
+    print(f"Average Grad-CAM IoU @ adaptive threshold: {np.mean(ious):.4f}")
 
 
 def _save_comparison_panel(rows, ious, output_dir):
