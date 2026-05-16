@@ -156,11 +156,7 @@ class CLIPGradCAM:
         raise RuntimeError("Could not find CLIP visual target layer for Grad-CAM")
 
     def _attribution_to_map(self, attribution, img_size):
-        attr = self._standardize_layer_output(attribution)
-        attr = self._drop_cls_token(attr)
-        attr = F.relu(attr)
-
-        token_scores = attr.mean(dim=-1)
+        token_scores = self._attribution_to_token_scores(attribution)
         grid_size = int(token_scores.shape[1] ** 0.5)
         if grid_size * grid_size != token_scores.shape[1]:
             raise RuntimeError(
@@ -176,6 +172,51 @@ class CLIPGradCAM:
         )
         cam = self._normalize_tensor(F.relu(cam[0, 0]))
         return cam.detach().cpu().numpy()
+
+    def _attribution_to_token_scores(self, attribution):
+        if isinstance(attribution, (tuple, list)):
+            attribution = attribution[0]
+
+        attr = F.relu(attribution)
+
+        if attr.dim() == 3:
+            # Captum LayerGradCam commonly returns [B, 1, tokens] for ViT
+            # layers because it sums over the hidden dimension. Treat that as
+            # an already channel-reduced token score map.
+            if attr.shape[1] == 1 and self._is_token_count(attr.shape[2]):
+                return self._drop_cls_token_scores(attr[:, 0, :])
+
+            if attr.shape[2] == 1 and self._is_token_count(attr.shape[1]):
+                return self._drop_cls_token_scores(attr[:, :, 0])
+
+            standardized = self._standardize_layer_output(attr)
+            standardized = self._drop_cls_token(standardized)
+            return standardized.mean(dim=-1)
+
+        if attr.dim() == 2 and self._is_token_count(attr.shape[1]):
+            return self._drop_cls_token_scores(attr)
+
+        raise RuntimeError(f"Unsupported Grad-CAM attribution shape: {tuple(attr.shape)}")
+
+    @staticmethod
+    def _is_token_count(n_tokens):
+        patch_tokens = n_tokens - 1
+        patch_grid = int(patch_tokens ** 0.5)
+        full_grid = int(n_tokens ** 0.5)
+        return patch_grid * patch_grid == patch_tokens or full_grid * full_grid == n_tokens
+
+    @staticmethod
+    def _drop_cls_token_scores(token_scores):
+        n_tokens = token_scores.shape[1]
+        grid_size = int((n_tokens - 1) ** 0.5)
+        if grid_size * grid_size == n_tokens - 1:
+            return token_scores[:, 1:]
+
+        grid_size = int(n_tokens ** 0.5)
+        if grid_size * grid_size == n_tokens:
+            return token_scores
+
+        raise RuntimeError(f"Token count {n_tokens} is not compatible with a square ViT grid")
 
     @staticmethod
     def _standardize_layer_output(tensor):
