@@ -4,10 +4,29 @@ import numpy as np
 from PIL import Image
 
 
-def compute_patch_scores(query_patch_features, memory_patch_bank):
-    dists = torch.cdist(query_patch_features, memory_patch_bank, p=2.0)
-    patch_scores = dists.min(dim=1).values
-    return patch_scores
+def compute_patch_scores(
+    query_patch_features,
+    memory_patch_bank,
+    metric="cosine",
+    top_k=1,
+):
+    if memory_patch_bank.numel() == 0:
+        raise ValueError("memory_patch_bank is empty")
+
+    top_k = max(1, min(int(top_k), memory_patch_bank.shape[0]))
+
+    if metric == "cosine":
+        query = F.normalize(query_patch_features.float(), dim=-1)
+        memory = F.normalize(memory_patch_bank.float(), dim=-1)
+        similarities = query @ memory.T
+        nearest = similarities.topk(top_k, dim=1).values.mean(dim=1)
+        return torch.clamp(1.0 - nearest, min=0.0)
+
+    if metric == "l2":
+        dists = torch.cdist(query_patch_features.float(), memory_patch_bank.float(), p=2.0)
+        return dists.topk(top_k, dim=1, largest=False).values.mean(dim=1)
+
+    raise ValueError(f"Unsupported patch score metric: {metric}")
 
 
 def scores_to_heatmap(patch_scores, img_size=256, patch_size=14, sigma=4.0, global_max=None, min_component_area=0):

@@ -4,6 +4,7 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -14,7 +15,20 @@ from model.memory_bank import MemoryBank
 from model.score_map import compute_patch_scores, scores_to_heatmap, overlay_heatmap
 
 
-def test_score_maps(data_dir, output_dir, device, category="bottle"):
+def test_score_maps(
+    data_dir,
+    output_dir,
+    device,
+    category="bottle",
+    n_shots=32,
+    patch_metric="cosine",
+    patch_top_k=3,
+    patch_layer="ln_post",
+    normal_percentile=99.0,
+    baseline_quantile=0.5,
+    sigma=12.0,
+    use_foreground_mask=True,
+):
     print("Loading CLIP backbone...")
     clip_model, _, _, device = load_backbone(device)
     clip_model.eval()
@@ -38,9 +52,9 @@ def test_score_maps(data_dir, output_dir, device, category="bottle"):
                             ]))
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
 
-    print("Building memory bank (8-shot)...")
-    bank = MemoryBank(feat_dim=768, mode="global")
-    bank.build(clip_model, train_loader, 8, device)
+    print(f"Building memory bank ({n_shots}-shot)...")
+    bank = MemoryBank(feat_dim=768, mode="global", patch_layer=patch_layer)
+    bank.build(clip_model, train_loader, n_shots, device)
     patch_bank = bank.get_patch_bank()
     print(f"  Memory bank: {bank.size} images, patch bank: {patch_bank.shape}")
 
@@ -48,7 +62,15 @@ def test_score_maps(data_dir, output_dir, device, category="bottle"):
     normal_scores = []
     for batch in train_loader:
         img_tensor, _ = batch
-        ps = _extract_patch_scores(clip_model, img_tensor, patch_bank, device)
+        ps = _extract_patch_scores(
+            clip_model,
+            img_tensor,
+            patch_bank,
+            device,
+            patch_metric,
+            patch_top_k,
+            patch_layer,
+        )
         if ps is not None:
             normal_scores.append(ps.cpu().numpy())
 
@@ -64,7 +86,15 @@ def test_score_maps(data_dir, output_dir, device, category="bottle"):
         label = label.item()
 
         if label == 1 and len(anom_panel) < 3:
-            ps = _extract_patch_scores(clip_model, img_tensor, patch_bank, device)
+            ps = _extract_patch_scores(
+                clip_model,
+                img_tensor,
+                patch_bank,
+                device,
+                patch_metric,
+                patch_top_k,
+                patch_layer,
+            )
             if ps is not None:
                 anomalous_scores.append(ps.cpu().numpy())
             anom_panel.append((img_tensor, mask_tensor))
@@ -75,18 +105,31 @@ def test_score_maps(data_dir, output_dir, device, category="bottle"):
             break
 
     normal_z_scores = [
-        _calibrate_patch_scores_array(s, normal_center, normal_scale)
+        _calibrate_patch_scores_array(
+            s,
+            normal_center,
+            normal_scale,
+            baseline_quantile,
+        )
         for s in normal_scores
     ]
     all_normal = np.concatenate(normal_z_scores)
-    global_max = max(float(np.percentile(all_normal, 99)), 1.0)
+    global_max = max(float(np.percentile(all_normal, normal_percentile)), 1.0)
     print(f"  normal 50th pct: {np.percentile(all_normal, 50):.4f}")
     print(f"  normal 95th pct: {np.percentile(all_normal, 95):.4f}")
-    print(f"  global_max (normal calibrated 99th pct): {global_max:.4f}")
+    print(
+        "  global_max "
+        f"(normal calibrated {normal_percentile:g}th pct): {global_max:.4f}"
+    )
 
     if anomalous_scores:
         anom_z_scores = [
-            _calibrate_patch_scores_array(s, normal_center, normal_scale)
+            _calibrate_patch_scores_array(
+                s,
+                normal_center,
+                normal_scale,
+                baseline_quantile,
+            )
             for s in anomalous_scores
         ]
         anom_maxes = [s.max() for s in anom_z_scores]
@@ -110,6 +153,12 @@ def test_score_maps(data_dir, output_dir, device, category="bottle"):
             min_component_area,
             normal_center,
             normal_scale,
+            patch_metric,
+            patch_top_k,
+            patch_layer,
+            baseline_quantile,
+            sigma,
+            use_foreground_mask,
         )
         anom_results.append(r)
 
@@ -126,6 +175,12 @@ def test_score_maps(data_dir, output_dir, device, category="bottle"):
             min_component_area,
             normal_center,
             normal_scale,
+            patch_metric,
+            patch_top_k,
+            patch_layer,
+            baseline_quantile,
+            sigma,
+            use_foreground_mask,
         )
         norm_results.append(r)
 
@@ -163,7 +218,10 @@ def test_score_maps(data_dir, output_dir, device, category="bottle"):
                 ax_mask.set_title(f"{label} #{col+1}: No GT")
             ax_mask.axis("off")
 
-    plt.suptitle(f"{category}: Score Maps (8-shot memory bank, calibrated residual)", fontsize=16)
+    plt.suptitle(
+        f"{category}: Score Maps ({n_shots}-shot memory bank, calibrated residual)",
+        fontsize=16,
+    )
     plt.tight_layout(rect=[0, 0, 1, 0.98])
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"{category}_score_maps_test.png")
@@ -172,23 +230,65 @@ def test_score_maps(data_dir, output_dir, device, category="bottle"):
     print(f"Saved: {path}")
 
 
-def _capture_hook(model):
-    target = getattr(model.visual, "ln_post", None)
+def _capture_hook(model, patch_layer="ln_post"):
+    target = _get_patch_hook_target(model, patch_layer)
     if target is None:
         return None, None
 
     patch_features = [None]
 
     def hook(module, inp, out):
-        patch_features[0] = out.detach()
+        patch_features[0] = _standardize_patch_features(out)
 
     handle = target.register_forward_hook(hook)
     return patch_features, handle
 
 
-def _extract_patch_scores(clip_model, img_tensor, patch_bank, device):
+def _get_patch_hook_target(model, patch_layer):
+    if patch_layer in (None, "ln_post"):
+        return getattr(model.visual, "ln_post", None)
+
+    layer = str(patch_layer)
+    if layer.startswith("resblock:"):
+        layer = layer.split(":", 1)[1]
+
+    try:
+        idx = int(layer)
+    except ValueError:
+        return getattr(model.visual, "ln_post", None)
+
+    transformer = getattr(model.visual, "transformer", None)
+    blocks = getattr(transformer, "resblocks", None)
+    if blocks is None:
+        return getattr(model.visual, "ln_post", None)
+    if idx < -len(blocks) or idx >= len(blocks):
+        return getattr(model.visual, "ln_post", None)
+    return blocks[idx]
+
+
+def _standardize_patch_features(out):
+    if isinstance(out, (tuple, list)):
+        out = out[0]
+
+    out = out.detach()
+    if out.dim() == 3 and out.shape[0] > out.shape[1] and out.shape[0] > 32:
+        out = out.permute(1, 0, 2)
+    return out
+
+
+def _extract_patch_scores(
+    clip_model,
+    img_tensor,
+    patch_bank,
+    device,
+    patch_metric="cosine",
+    patch_top_k=3,
+    patch_layer="ln_post",
+):
     img_tensor = img_tensor.to(device)
-    pf_hook, handle = _capture_hook(clip_model)
+    pf_hook, handle = _capture_hook(clip_model, patch_layer)
+    if handle is None:
+        return None
     with torch.no_grad():
         _ = clip_model.encode_image(img_tensor)
     patch_feats_all = pf_hook[0]
@@ -207,7 +307,12 @@ def _extract_patch_scores(clip_model, img_tensor, patch_bank, device):
         proj = getattr(clip_model.visual, "proj", None)
         if proj is not None:
             pb = pb @ proj.detach().to(pb.device)
-    return compute_patch_scores(query_patches, pb.to(query_patches.device))
+    return compute_patch_scores(
+        query_patches,
+        pb.to(query_patches.device),
+        metric=patch_metric,
+        top_k=patch_top_k,
+    )
 
 
 def _build_patch_calibration(normal_scores):
@@ -222,18 +327,67 @@ def _build_patch_calibration(normal_scores):
     return center, scale
 
 
-def _calibrate_patch_scores_array(scores, normal_center, normal_scale, baseline_quantile=0.5):
+def _calibrate_patch_scores_array(
+    scores,
+    normal_center,
+    normal_scale,
+    baseline_quantile=0.5,
+):
     z = np.maximum((scores - normal_center) / normal_scale, 0.0)
     baseline = np.quantile(z, baseline_quantile)
     return np.maximum(z - baseline, 0.0)
 
 
-def _calibrate_patch_scores_tensor(patch_scores, normal_center, normal_scale, baseline_quantile=0.5):
+def _calibrate_patch_scores_tensor(
+    patch_scores,
+    normal_center,
+    normal_scale,
+    baseline_quantile=0.5,
+):
     center = torch.as_tensor(normal_center, device=patch_scores.device, dtype=patch_scores.dtype)
     scale = torch.as_tensor(normal_scale, device=patch_scores.device, dtype=patch_scores.dtype)
     z = torch.clamp((patch_scores - center) / scale, min=0.0)
     baseline = torch.quantile(z, baseline_quantile)
     return torch.clamp(z - baseline, min=0.0)
+
+
+def _apply_foreground_mask(heatmap, image_np):
+    mask = _estimate_foreground_mask(image_np, heatmap.device)
+    if mask is None:
+        return heatmap
+    return heatmap * mask.unsqueeze(0)
+
+
+def _estimate_foreground_mask(image_np, device):
+    img = np.asarray(image_np, dtype=np.float32)
+    h, w = img.shape[:2]
+
+    border_width = max(4, min(h, w) // 32)
+    border = np.concatenate([
+        img[:border_width].reshape(-1, 3),
+        img[-border_width:].reshape(-1, 3),
+        img[:, :border_width].reshape(-1, 3),
+        img[:, -border_width:].reshape(-1, 3),
+    ], axis=0)
+
+    if float(border.std(axis=0).mean()) > 0.08:
+        return None
+
+    background = np.median(border, axis=0)
+    color_dist = np.linalg.norm(img - background, axis=2)
+    border_dist = np.linalg.norm(border - background, axis=1)
+    threshold = max(0.10, float(np.percentile(border_dist, 95)) * 3.0)
+
+    foreground = color_dist > threshold
+    coverage = float(foreground.mean())
+    if coverage < 0.05 or coverage > 0.95:
+        return None
+
+    mask = torch.from_numpy(foreground.astype(np.float32)).to(device)
+    mask = mask.view(1, 1, h, w)
+    mask = F.max_pool2d(mask, kernel_size=21, stride=1, padding=10)
+    mask = F.avg_pool2d(mask, kernel_size=21, stride=1, padding=10)
+    return torch.clamp(mask.squeeze(0).squeeze(0), 0.0, 1.0)
 
 
 def _process_one(
@@ -247,6 +401,12 @@ def _process_one(
     min_component_area=0,
     normal_center=None,
     normal_scale=None,
+    patch_metric="cosine",
+    patch_top_k=3,
+    patch_layer="ln_post",
+    baseline_quantile=0.5,
+    sigma=12.0,
+    use_foreground_mask=True,
 ):
     img_tensor = img_tensor.to(device)
     orig_np = _denormalize(img_tensor[0]).permute(1, 2, 0).cpu().numpy()
@@ -255,7 +415,15 @@ def _process_one(
     if mask_tensor is not None:
         mask_np = mask_tensor.squeeze().cpu().numpy()
 
-    patch_scores = _extract_patch_scores(clip_model, img_tensor, patch_bank, device)
+    patch_scores = _extract_patch_scores(
+        clip_model,
+        img_tensor,
+        patch_bank,
+        device,
+        patch_metric,
+        patch_top_k,
+        patch_layer,
+    )
     if patch_scores is None:
         return orig_np, np.zeros((224, 224)), orig_np, mask_np
 
@@ -264,15 +432,18 @@ def _process_one(
             patch_scores,
             normal_center,
             normal_scale,
+            baseline_quantile,
         )
 
     heatmap = scores_to_heatmap(
         patch_scores,
         img_size=224,
-        sigma=12.0,
+        sigma=sigma,
         global_max=global_max,
         min_component_area=min_component_area,
     )
+    if use_foreground_mask:
+        heatmap = _apply_foreground_mask(heatmap, orig_np)
     overlay_img = overlay_heatmap((orig_np * 255).astype(np.uint8), heatmap, alpha=0.5)
 
     hm_np = heatmap.squeeze().cpu().numpy()
@@ -295,8 +466,41 @@ def main():
     parser.add_argument("--output_dir", default="./outputs/heatmaps")
     parser.add_argument("--device", default=None)
     parser.add_argument("--category", default="bottle")
+    parser.add_argument("--n_shots", type=int, default=32)
+    parser.add_argument(
+        "--patch_metric",
+        choices=["cosine", "l2"],
+        default="cosine",
+    )
+    parser.add_argument("--patch_top_k", type=int, default=3)
+    parser.add_argument(
+        "--patch_layer",
+        default="ln_post",
+        help="Patch-token hook: 'ln_post' or transformer resblock index like -2.",
+    )
+    parser.add_argument("--normal_percentile", type=float, default=99.0)
+    parser.add_argument("--baseline_quantile", type=float, default=0.5)
+    parser.add_argument("--sigma", type=float, default=12.0)
+    parser.add_argument(
+        "--disable_foreground_mask",
+        action="store_true",
+        help="Disable conservative border-based foreground masking.",
+    )
     args = parser.parse_args()
-    test_score_maps(args.data_dir, args.output_dir, args.device, args.category)
+    test_score_maps(
+        args.data_dir,
+        args.output_dir,
+        args.device,
+        args.category,
+        args.n_shots,
+        args.patch_metric,
+        args.patch_top_k,
+        args.patch_layer,
+        args.normal_percentile,
+        args.baseline_quantile,
+        args.sigma,
+        not args.disable_foreground_mask,
+    )
 
 
 if __name__ == "__main__":

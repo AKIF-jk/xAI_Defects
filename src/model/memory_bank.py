@@ -5,9 +5,10 @@ import torch.nn.functional as F
 
 
 class MemoryBank:
-    def __init__(self, feat_dim=768, mode="global"):
+    def __init__(self, feat_dim=768, mode="global", patch_layer="ln_post"):
         self.feat_dim = feat_dim
         self.mode = mode
+        self.patch_layer = patch_layer
         self.index = faiss.IndexFlatL2(feat_dim)
         self.patch_bank = []
         self._patch_features = None
@@ -21,14 +22,45 @@ class MemoryBank:
         self._proj_matrix = None
 
     def _register_hook(self, model):
-        target = getattr(model.visual, "ln_post", None)
+        target = self._get_patch_hook_target(model)
         if target is None:
             return
 
         def hook(module, inp, out):
-            self._patch_features = out.detach()
+            self._patch_features = self._standardize_patch_features(out)
 
         self._hook_handle = target.register_forward_hook(hook)
+
+    def _get_patch_hook_target(self, model):
+        if self.patch_layer in (None, "ln_post"):
+            return getattr(model.visual, "ln_post", None)
+
+        layer = str(self.patch_layer)
+        if layer.startswith("resblock:"):
+            layer = layer.split(":", 1)[1]
+
+        try:
+            idx = int(layer)
+        except ValueError:
+            return getattr(model.visual, "ln_post", None)
+
+        transformer = getattr(model.visual, "transformer", None)
+        blocks = getattr(transformer, "resblocks", None)
+        if blocks is None:
+            return getattr(model.visual, "ln_post", None)
+        if idx < -len(blocks) or idx >= len(blocks):
+            return getattr(model.visual, "ln_post", None)
+        return blocks[idx]
+
+    @staticmethod
+    def _standardize_patch_features(out):
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+
+        out = out.detach()
+        if out.dim() == 3 and out.shape[0] > out.shape[1] and out.shape[0] > 32:
+            out = out.permute(1, 0, 2)
+        return out
 
     def _remove_hook(self):
         if self._hook_handle is not None:
