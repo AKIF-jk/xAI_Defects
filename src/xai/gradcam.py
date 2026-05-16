@@ -71,12 +71,12 @@ class CLIPGradCAM:
         image_tensor = image_tensor.to(memory_tensor.device)
 
         with torch.no_grad():
-            score, activation = self._forward_with_activation(
+            base_score, activation = self._forward_with_activation(
                 image_tensor,
                 memory_tensor,
                 class_name,
             )
-            del score
+            base_score = base_score.mean()
 
         tokens = self._standardize_layer_output(activation)
         tokens = self._drop_cls_token(tokens)
@@ -110,6 +110,7 @@ class CLIPGradCAM:
                     memory_tensor,
                     class_name,
                 ).mean()
+                channel_weight = F.relu(channel_score - base_score)
 
             upsampled = F.interpolate(
                 act,
@@ -117,7 +118,7 @@ class CLIPGradCAM:
                 mode="bilinear",
                 align_corners=False,
             ).squeeze()
-            weighted = weighted + F.relu(channel_score) * upsampled
+            weighted = weighted + channel_weight * upsampled
 
         weighted = F.relu(weighted)
         weighted = self._normalize_tensor(weighted)
