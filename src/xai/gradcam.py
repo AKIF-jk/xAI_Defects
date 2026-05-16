@@ -52,7 +52,10 @@ class CLIPGradCAM:
         image_tensor = image_tensor.requires_grad_(True)
 
         with self._temporarily_unfreeze(self.target_layer):
-            attribution = self.gradcam.attribute(image_tensor)
+            attribution = self.gradcam.attribute(
+                image_tensor,
+                attr_dim_summation=False,
+            )
 
         gradcam_map = self._attribution_to_map(attribution, img_size)
         return gradcam_map
@@ -130,12 +133,11 @@ class CLIPGradCAM:
         global_feat = self.clip_model.encode_image(image_tensor)
         adapted = self.model.visual_adapter(global_feat)
         score = self.model.prompt_query_adapter(adapted, memory_bank)
-        # NEGATE: prompt_query_adapter returns a similarity/normality score
-        # (higher = more similar to normal references = less anomalous).
-        # Grad-CAM needs d(anomaly)/d(activation), so we flip the sign here
-        # to make the scalar we differentiate increase with anomaly severity.
-        # Without this, all gradients are negative and F.relu wipes the entire map.
-        return -score.view(image_tensor.shape[0], -1)
+        # PromptQueryAdapter is used as an anomaly score throughout evaluation:
+        # larger memory-bank distance increases the score, and label=1 is the
+        # positive class for AUROC. Keep that direction for Grad-CAM; negating it
+        # turns anomaly evidence negative and the final ReLU erases the map.
+        return score.view(image_tensor.shape[0], -1)
 
     def _patch_anomaly_score_tensor(self, image_tensor, memory_bank):
         # NOTE: Only used when score_mode="patch" is explicitly requested.
@@ -203,23 +205,18 @@ class CLIPGradCAM:
         return score, self._last_activation
 
     def _find_target_layer(self):
-        # FIX #1: Hook the full last residual block instead of its ln_2 sub-layer.
-        #
-        # Original code: target = getattr(last_block, "ln_2", None)
-        # ln_2 is a LayerNorm applied after the MLP; it normalises activations to
-        # roughly unit variance, so gradients flowing back through it collapse to
-        # near-zero and carry no spatial discrimination. Attaching Grad-CAM here
-        # gives a flat, near-zero attribution map (mean ~0.02, IoU ~0).
-        #
-        # The correct hook point for ViT Grad-CAM is the residual block itself
-        # (resblocks[-1]). Its output is the sum of the attention and MLP branches
-        # *before* any normalisation, so gradients are strong and spatially varied.
         visual = getattr(self.clip_model, "visual", None)
         transformer = getattr(visual, "transformer", None)
         blocks = getattr(transformer, "resblocks", None)
         if blocks is not None and len(blocks) > 0:
-            # Return the full last residual block — not a sub-layer of it.
-            return blocks[-1]
+            # CLIP ViT uses CLS-token pooling. At the output of the final block,
+            # patch tokens no longer affect the pooled score, so their gradients
+            # are zero. Hook the pre-attention norm instead; patch tokens at this
+            # point can still influence the CLS token through the last attention.
+            target = getattr(blocks[-1], "ln_1", None)
+            if target is not None:
+                return target
+            return blocks[-2] if len(blocks) > 1 else blocks[-1]
 
         # Fallback for non-standard CLIP visual backbones.
         target = getattr(visual, "ln_post", None)
@@ -254,25 +251,22 @@ class CLIPGradCAM:
         if isinstance(attribution, (tuple, list)):
             attribution = attribution[0]
 
-        # Do NOT apply F.relu here. Captum's LayerGradCam already sums
-        # grad * activation; clamping to positive at this stage throws away
-        # signal we need. A single relu+normalise is applied only at the very
-        # end in _attribution_to_map, after tokens have been spatially arranged.
+        # Do NOT apply F.relu here. Captum has already multiplied gradients and
+        # activations. We keep channel attributions until the tensor is in
+        # [B, tokens, C] layout, then reduce only the channel dimension.
         attr = attribution
 
         if attr.dim() == 3:
-            # Captum LayerGradCam commonly returns [B, 1, tokens] for ViT
-            # layers because it sums over the hidden dimension. Treat that as
-            # an already channel-reduced token score map.
-            if attr.shape[1] == 1 and self._is_token_count(attr.shape[2]):
-                return self._drop_cls_token_scores(attr[:, 0, :])
-
-            if attr.shape[2] == 1 and self._is_token_count(attr.shape[1]):
-                return self._drop_cls_token_scores(attr[:, :, 0])
-
             standardized = self._standardize_layer_output(attr)
+
+            if standardized.shape[-1] == 1 and self._is_token_count(standardized.shape[1]):
+                return self._drop_cls_token_scores(standardized[:, :, 0])
+
+            if standardized.shape[1] == 1 and self._is_token_count(standardized.shape[2]):
+                return self._drop_cls_token_scores(standardized[:, 0, :])
+
             standardized = self._drop_cls_token(standardized)
-            return standardized.mean(dim=-1)
+            return standardized.sum(dim=-1)
 
         if attr.dim() == 2 and self._is_token_count(attr.shape[1]):
             return self._drop_cls_token_scores(attr)
@@ -434,7 +428,7 @@ def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
         # np.percentile(gradcam, 80) selects the top 20% of pixels, which is a
         # robust, distribution-agnostic way to identify high-activation regions.
         threshold = float(np.percentile(gradcam, 80))
-        pred = gradcam >= threshold
+        pred = gradcam > threshold
         union = np.logical_or(pred, mask).sum()
         intersection = np.logical_and(pred, mask).sum()
         iou = float(intersection / union) if union > 0 else 0.0
