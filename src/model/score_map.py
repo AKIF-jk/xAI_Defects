@@ -19,7 +19,12 @@ def scores_to_heatmap(patch_scores, img_size=256, patch_size=14, sigma=4.0, glob
     smoothed = F.conv2d(upsampled, kernel, padding=kernel.shape[-1] // 2)
 
     if global_max is not None:
-        smoothed = torch.clamp(smoothed / global_max, 0, 1)
+        smoothed = smoothed / global_max
+        lo, hi = smoothed.min(), smoothed.max()
+        if hi > lo:
+            smoothed = (smoothed - lo) / (hi - lo)
+        else:
+            smoothed = torch.zeros_like(smoothed)
     else:
         lo, hi = smoothed.min(), smoothed.max()
         if hi > lo:

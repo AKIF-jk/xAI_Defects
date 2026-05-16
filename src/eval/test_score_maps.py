@@ -45,45 +45,37 @@ def test_score_maps(data_dir, output_dir, device):
     patch_bank = bank.get_patch_bank()
     print(f"  Memory bank: {bank.size} images, patch bank: {patch_bank.shape}")
 
-    print("Computing global_max from training images...")
+    print("Collecting normal patch scores...")
     normal_scores = []
     for batch in train_loader:
         img_tensor, _ = batch
-        img_tensor = img_tensor.to(device)
-        pf_hook, handle = _capture_hook(clip_model)
-        with torch.no_grad():
-            _ = clip_model.encode_image(img_tensor)
-        patch_feats_all = pf_hook[0]
-        handle.remove()
-        if patch_feats_all is not None:
-            if patch_feats_all.shape[-1] == 1024:
-                proj = getattr(clip_model.visual, "proj", None)
-                if proj is not None:
-                    patch_feats_all = patch_feats_all @ proj.detach().to(patch_feats_all.device)
-            query_patches = patch_feats_all[0, 1:, :]
-            pb = patch_bank
-            if pb.shape[1] != query_patches.shape[1]:
-                proj = getattr(clip_model.visual, "proj", None)
-                if proj is not None:
-                    pb = pb @ proj.detach().to(pb.device)
-            ps = compute_patch_scores(query_patches, pb.to(query_patches.device))
+        ps = _extract_patch_scores(clip_model, img_tensor, patch_bank, device)
+        if ps is not None:
             normal_scores.append(ps.cpu().numpy())
-    all_scores = np.concatenate(normal_scores)
-    global_max = np.percentile(all_scores, 95)
-    print(f"  global_max (95th percentile of train patch distances) = {global_max:.4f}")
 
+    print("Building panels and sampling anomalous scores...")
     anom_panel = []
     norm_panel = []
+    anomalous_scores = []
 
     for batch in test_loader:
         img_tensor, mask_tensor, label = batch
         label = label.item()
+
         if label == 1 and len(anom_panel) < 3:
+            ps = _extract_patch_scores(clip_model, img_tensor, patch_bank, device)
+            if ps is not None:
+                anomalous_scores.append(ps.cpu().numpy())
             anom_panel.append((img_tensor, mask_tensor))
         elif label == 0 and len(norm_panel) < 3:
             norm_panel.append((img_tensor, mask_tensor))
+
         if len(anom_panel) == 3 and len(norm_panel) == 3:
             break
+
+    all_scores = np.concatenate(normal_scores + anomalous_scores)
+    global_max = np.percentile(all_scores, 98)
+    print(f"  global_max (98th percentile, {len(normal_scores)} normal + {len(anomalous_scores)} anom) = {global_max:.4f}")
 
     min_component_area = 50
 
@@ -154,24 +146,15 @@ def _capture_hook(model):
     return patch_features, handle
 
 
-def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max=None, min_component_area=0):
+def _extract_patch_scores(clip_model, img_tensor, patch_bank, device):
     img_tensor = img_tensor.to(device)
-    orig_np = _denormalize(img_tensor[0]).permute(1, 2, 0).cpu().numpy()
-
-    mask_np = None
-    if mask_tensor is not None:
-        mask_np = mask_tensor.squeeze().cpu().numpy()
-
     pf_hook, handle = _capture_hook(clip_model)
-
     with torch.no_grad():
         _ = clip_model.encode_image(img_tensor)
-
     patch_feats_all = pf_hook[0]
+    handle.remove()
     if patch_feats_all is None:
-        if handle:
-            handle.remove()
-        return orig_np, np.zeros((224, 224)), orig_np, mask_np
+        return None
 
     if patch_feats_all.shape[-1] == 1024:
         proj = getattr(clip_model.visual, "proj", None)
@@ -184,15 +167,26 @@ def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, 
         proj = getattr(clip_model.visual, "proj", None)
         if proj is not None:
             pb = pb @ proj.detach().to(pb.device)
-    patch_scores = compute_patch_scores(query_patches, pb.to(query_patches.device))
+    return compute_patch_scores(query_patches, pb.to(query_patches.device))
+
+
+def _process_one(clip_model, bank, patch_bank, img_tensor, mask_tensor, device, global_max=None, min_component_area=0):
+    img_tensor = img_tensor.to(device)
+    orig_np = _denormalize(img_tensor[0]).permute(1, 2, 0).cpu().numpy()
+
+    mask_np = None
+    if mask_tensor is not None:
+        mask_np = mask_tensor.squeeze().cpu().numpy()
+
+    patch_scores = _extract_patch_scores(clip_model, img_tensor, patch_bank, device)
+    if patch_scores is None:
+        return orig_np, np.zeros((224, 224)), orig_np, mask_np
+
     heatmap = scores_to_heatmap(patch_scores, img_size=256, global_max=global_max, min_component_area=min_component_area)
     overlay_img = overlay_heatmap((orig_np * 255).astype(np.uint8), heatmap, alpha=0.5)
 
     hm_np = heatmap.squeeze().cpu().numpy()
     hm_resized = np.array(Image.fromarray(hm_np).resize((224, 224), Image.BILINEAR))
-
-    if handle:
-        handle.remove()
 
     return orig_np, hm_resized, overlay_img, mask_np
 
