@@ -151,15 +151,9 @@ class AdaptCLIPModel(nn.Module):
             self._hook_handle = None
 
     def forward(self, image, memory_bank, class_name):
-        _ = self.clip_model.encode_image(image)
-        patch_feats = self._patch_features
-        if patch_feats is None:
-            with torch.no_grad():
-                _ = self.clip_model.encode_image(image)
-                patch_feats = self._patch_features
-
         with torch.no_grad():
             global_feat = self.clip_model.encode_image(image)
+        patch_feats = self._patch_features
         adapted = self.visual_adapter(global_feat)
 
         score = self.prompt_query_adapter(adapted, memory_bank)

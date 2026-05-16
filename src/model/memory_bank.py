@@ -60,7 +60,10 @@ class MemoryBank:
         self.patch_bank = []
         self._patch_features = None
         self._n_stored = 0
-        self._register_hook(model)
+
+        model_has_hook = hasattr(model, '_patch_features') and model._hook_handle is not None
+        if not model_has_hook:
+            self._register_hook(model)
 
         self._proj_matrix = getattr(model.visual, "proj", None)
         if self._proj_matrix is not None and isinstance(self._proj_matrix, nn.Parameter):
@@ -81,7 +84,7 @@ class MemoryBank:
             with torch.no_grad():
                 global_feats = model.encode_image(images)
 
-            patch_feats = self._patch_features
+            patch_feats = model._patch_features if model_has_hook else self._patch_features
 
             for i in range(images.size(0)):
                 if count >= n_shots:
@@ -93,11 +96,16 @@ class MemoryBank:
                 self.index.add(feat_np)
 
                 if pf is not None:
-                    self.patch_bank.append(pf[1:].cpu())
+                    proj = getattr(model.visual, "proj", None)
+                    patch_tokens = pf[1:]
+                    if proj is not None:
+                        patch_tokens = patch_tokens @ proj.detach().to(patch_tokens.device)
+                    self.patch_bank.append(patch_tokens.cpu())
                 self._n_stored += 1
                 count += 1
 
-        self._remove_hook()
+        if not model_has_hook:
+            self._remove_hook()
         return self._n_stored
 
     def query(self, query_feat, k=1):
