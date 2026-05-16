@@ -328,7 +328,7 @@ def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
         gradcam = xai.generate(image_tensor, memory_tensor, "cable", img_size=img_size)
         scorecam = xai.generate_scorecam(image_tensor, memory_tensor, "cable", img_size=img_size)
 
-        original = _denormalize(image_tensor[0]).permute(1, 2, 0).cpu().numpy()
+        original = _denormalize(image_tensor[0]).permute(1, 2, 0).detach().cpu().numpy()
         original_u8 = (np.clip(original, 0, 1) * 255).astype(np.uint8)
         grad_overlay = overlay_heatmap(original_u8, gradcam, alpha=0.5)
         score_overlay = overlay_heatmap(original_u8, scorecam, alpha=0.5)
