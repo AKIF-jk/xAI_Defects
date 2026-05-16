@@ -73,9 +73,18 @@ def test_score_maps(data_dir, output_dir, device):
         if len(anom_panel) == 3 and len(norm_panel) == 3:
             break
 
-    all_scores = np.concatenate(normal_scores + anomalous_scores)
-    global_max = np.percentile(all_scores, 98)
-    print(f"  global_max (98th percentile, {len(normal_scores)} normal + {len(anomalous_scores)} anom) = {global_max:.4f}")
+    all_normal = np.concatenate(normal_scores)
+    global_max = np.percentile(all_normal, 99)
+    print(f"  normal 50th pct: {np.percentile(all_normal, 50):.4f}")
+    print(f"  normal 95th pct: {np.percentile(all_normal, 95):.4f}")
+    print(f"  global_max (normal 99th pct): {global_max:.4f}")
+
+    if anomalous_scores:
+        anom_maxes = [s.max() for s in anomalous_scores]
+        print(
+            "  mean anomalous max patch score: "
+            f"{np.mean(anom_maxes):.4f}  (should exceed global_max)"
+        )
 
     min_component_area = 50
 
