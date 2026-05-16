@@ -233,12 +233,17 @@ def evaluate_category_shot(
         raw_normal_scores = _collect_normal_patch_scores(
             clip_model,
             train_loader,
+            n_shots,
             patch_bank,
             device,
             patch_metric,
             patch_top_k,
             patch_layer,
         )
+        if not raw_normal_scores:
+            raise RuntimeError(
+                f"No normal calibration scores collected for {category} {shot_mode}"
+            )
         normal_center, normal_scale = _build_patch_calibration(raw_normal_scores)
         normal_z = [
             _calibrate_patch_scores_array(
@@ -322,6 +327,7 @@ def evaluate_category_shot(
 def _collect_normal_patch_scores(
     clip_model,
     train_loader,
+    n_shots,
     patch_bank,
     device,
     patch_metric,
@@ -329,7 +335,10 @@ def _collect_normal_patch_scores(
     patch_layer,
 ):
     scores = []
+    count = 0
     for images, _ in train_loader:
+        if count >= n_shots:
+            break
         image = images.to(device)
         _, query_patches = _extract_features(clip_model, image, patch_layer)
         if query_patches is None:
@@ -341,6 +350,7 @@ def _collect_normal_patch_scores(
             top_k=patch_top_k,
         )
         scores.append(patch_scores.detach().cpu().numpy())
+        count += images.size(0)
     return scores
 
 
