@@ -88,8 +88,6 @@ class CLIPGradCAM:
 
         acts = tokens[0].T.reshape(tokens.shape[-1], grid_size, grid_size)
         acts = F.relu(acts)
-        global_min = acts.min()
-        global_max = acts.max()
         weighted = torch.zeros((img_size, img_size), device=image_tensor.device)
 
         base_h, base_w = image_tensor.shape[-2:]
@@ -101,26 +99,26 @@ class CLIPGradCAM:
                 mode="bilinear",
                 align_corners=False,
             )
-            mask = (mask - global_min) / (global_max - global_min + 1e-8)
+            mask = self._normalize_tensor(mask)
             if torch.count_nonzero(mask) == 0:
                 continue
 
-            masked_image = image_tensor * mask
+            occluded_image = image_tensor * (1.0 - mask)
             with torch.no_grad():
-                channel_score = self._score_tensor(
-                    masked_image,
+                occluded_score = self._score_tensor(
+                    occluded_image,
                     memory_tensor,
                     class_name,
                 ).mean()
-                channel_weight = F.relu(channel_score - base_score)
+                channel_weight = F.relu(base_score - occluded_score)
 
-            upsampled = F.interpolate(
-                act,
+            heat_mask = F.interpolate(
+                mask,
                 size=(img_size, img_size),
                 mode="bilinear",
                 align_corners=False,
             ).squeeze()
-            weighted = weighted + channel_weight * upsampled
+            weighted = weighted + channel_weight * heat_mask
 
         weighted = F.relu(weighted)
         weighted = self._normalize_tensor(weighted)
