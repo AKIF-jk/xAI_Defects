@@ -88,6 +88,8 @@ class CLIPGradCAM:
 
         acts = tokens[0].T.reshape(tokens.shape[-1], grid_size, grid_size)
         acts = F.relu(acts)
+        global_min = acts.min()
+        global_max = acts.max()
         weighted = torch.zeros((img_size, img_size), device=image_tensor.device)
 
         base_h, base_w = image_tensor.shape[-2:]
@@ -99,7 +101,7 @@ class CLIPGradCAM:
                 mode="bilinear",
                 align_corners=False,
             )
-            mask = self._normalize_tensor(mask)
+            mask = (mask - global_min) / (global_max - global_min + 1e-8)
             if torch.count_nonzero(mask) == 0:
                 continue
 
