@@ -151,6 +151,19 @@ def _denormalize_image(tensor):
     return (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
 
+def _as_memory_tensor(memory_bank, device):
+    if isinstance(memory_bank, torch.Tensor):
+        memory = memory_bank
+    elif hasattr(memory_bank, "index"):
+        vectors = memory_bank.index.reconstruct_n(0, memory_bank.index.ntotal)
+        memory = torch.from_numpy(vectors)
+    else:
+        memory = torch.as_tensor(memory_bank)
+    if memory.numel() == 0:
+        raise ValueError("memory_bank is empty; need at least one reference")
+    return memory.float().to(device)
+
+
 def explain_defect(
     image,
     model,
@@ -166,9 +179,12 @@ def explain_defect(
     if image.dim() == 3:
         image = image.unsqueeze(0)
 
+    device = image.device
+    memory_tensor = _as_memory_tensor(memory_bank, device)
+
     # 1. Score via AdaptCLIP forward
     with torch.no_grad():
-        score_tensor, _ = model(image, memory_bank, class_name)
+        score_tensor, _ = model(image, memory_tensor, class_name)
     anomaly_score = float(score_tensor[0].sigmoid().item())
 
     # 2. GradCAM heatmap
