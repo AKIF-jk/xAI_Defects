@@ -1,7 +1,10 @@
 import argparse
+import logging
 import os
 import sys
 import time
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
@@ -49,12 +52,16 @@ class PatchSHAPExplainer:
     def explain(self, image_numpy, n_evals=200):
         import shap
 
+        logger.info("Starting SHAP explanation (n_evals=%d, grid_size=%d)", n_evals, self.grid_size)
         image_numpy = self._validate_image_numpy(image_numpy)
         masker = shap.maskers.Image("inpaint_telea", image_numpy.shape)
         explainer = shap.Explainer(self._predict, masker)
+        logger.debug("Computing SHAP values with %d evaluations...", n_evals)
         shap_values = explainer(image_numpy[np.newaxis], max_evals=n_evals)
+        logger.debug("SHAP values computed, shape=%s", shap_values.values.shape)
         shap_map = self._values_to_map(shap_values.values)
         shap_map = self._grid_average_map(shap_map, self.grid_size)
+        logger.info("SHAP explanation complete")
         return shap_map.astype(np.float32)
 
     @staticmethod
@@ -192,8 +199,10 @@ def run_leather_shap_test(
 
     train_ds = MVTecDataset(data_dir, "leather", split="train", transform=transform)
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
+    logger.info("Building memory bank with n_shots=%d...", n_shots)
     memory = MemoryBank(feat_dim=768, mode="global")
     memory.build(clip_model, train_loader, n_shots, device)
+    logger.info("Memory bank built with %d vectors", memory.size)
 
     test_ds = MVTecDataset(
         data_dir,
@@ -208,8 +217,9 @@ def run_leather_shap_test(
     rows = []
     anomalous_count = 0
     normal_count = 0
-    for image_tensor, mask_tensor, label in test_loader:
+    for idx, (image_tensor, mask_tensor, label) in enumerate(test_loader):
         label_int = int(label.item())
+        kind = "anomalous" if label_int == 1 else "normal"
         if label_int == 1:
             if anomalous_count >= 3:
                 continue
@@ -219,6 +229,7 @@ def run_leather_shap_test(
                 continue
             normal_count += 1
 
+        logger.info("Processing %s image %d (anomalous=%d, normal=%d)...", kind, idx, anomalous_count, normal_count)
         image_tensor = image_tensor.to(device)
         image_np = _tensor_to_image_numpy(image_tensor[0])
         mask_np = mask_tensor.squeeze().cpu().numpy() > 0.5
@@ -231,6 +242,7 @@ def run_leather_shap_test(
         heatmap = _normalize_for_display(shap_map)
         best_overlap_value = _best_gt_overlap_patch_value(shap_map, mask_np, grid_size)
 
+        logger.info("Finished %s image %d in %.2fs", kind, idx, runtime)
         kind = "anomalous" if label_int == 1 else "normal"
         if np.isnan(best_overlap_value):
             print(
@@ -250,6 +262,7 @@ def run_leather_shap_test(
     if not rows:
         raise RuntimeError("No leather test images found for SHAP demo")
 
+    logger.info("Saving SHAP panel with %d images to %s...", len(rows), output_dir)
     _save_shap_panel(rows, output_dir)
 
 
@@ -329,6 +342,7 @@ def _save_shap_panel(rows, output_dir):
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {path}")
+    logger.info("SHAP demo complete")
 
 
 def main():
