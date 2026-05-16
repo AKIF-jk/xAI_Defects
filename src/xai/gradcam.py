@@ -130,7 +130,12 @@ class CLIPGradCAM:
         global_feat = self.clip_model.encode_image(image_tensor)
         adapted = self.model.visual_adapter(global_feat)
         score = self.model.prompt_query_adapter(adapted, memory_bank)
-        return score.view(image_tensor.shape[0], -1)
+        # NEGATE: prompt_query_adapter returns a similarity/normality score
+        # (higher = more similar to normal references = less anomalous).
+        # Grad-CAM needs d(anomaly)/d(activation), so we flip the sign here
+        # to make the scalar we differentiate increase with anomaly severity.
+        # Without this, all gradients are negative and F.relu wipes the entire map.
+        return -score.view(image_tensor.shape[0], -1)
 
     def _patch_anomaly_score_tensor(self, image_tensor, memory_bank):
         # NOTE: Only used when score_mode="patch" is explicitly requested.
@@ -249,7 +254,11 @@ class CLIPGradCAM:
         if isinstance(attribution, (tuple, list)):
             attribution = attribution[0]
 
-        attr = F.relu(attribution)
+        # Do NOT apply F.relu here. Captum's LayerGradCam already sums
+        # grad * activation; clamping to positive at this stage throws away
+        # signal we need. A single relu+normalise is applied only at the very
+        # end in _attribution_to_map, after tokens have been spatially arranged.
+        attr = attribution
 
         if attr.dim() == 3:
             # Captum LayerGradCam commonly returns [B, 1, tokens] for ViT
@@ -379,16 +388,11 @@ def run_cable_demo(data_dir, output_dir, device=None, n_shots=4, img_size=224):
     train_ds = MVTecDataset(data_dir, "cable", split="train", transform=transform)
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
 
-    # FIX #4: MemoryBank mode changed from "global" to "patch".
-    # The original code built a global-average memory bank (one vector per image)
-    # and then compared individual patch tokens against it inside
-    # _patch_anomaly_score_tensor. Global vectors and patch tokens live in
-    # different statistical spaces, so cosine similarity is meaningless.
-    # A patch-level bank stores per-patch features, making patch-vs-memory
-    # comparisons geometrically valid.
-    # NOTE: feat_dim may need adjustment to match your patch token dimensionality
-    # (commonly 1024 for ViT-L/14 patch tokens before projection, or 768 for ViT-B).
-    memory = MemoryBank(feat_dim=768, mode="patch")
+    # FIX #4 (revised): Revert to mode="global". The patch mode in this MemoryBank
+    # implementation still collapses patch tokens to a single mean vector per image
+    # (patch_mean = patch_feats[:, 1:, :].mean(dim=1)), making it functionally
+    # identical to global mode. Using "global" is therefore correct and unambiguous.
+    memory = MemoryBank(feat_dim=768, mode="global")
     memory.build(clip_model, train_loader, n_shots, device)
     memory_tensor = torch.from_numpy(memory.index.reconstruct_n(0, memory.index.ntotal)).to(device)
 
