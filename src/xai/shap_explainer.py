@@ -78,9 +78,11 @@ class PatchSHAPExplainer:
 
     def _values_to_map(self, values, height, width):
         values = np.asarray(values)
-        if values.ndim == 2:
+        if values.ndim == 4:
+            values = values[0].mean(axis=-1)
+        elif values.ndim == 2:
             values = values[0]
-        if values.ndim != 1:
+        if values.ndim not in (1, 2):
             raise RuntimeError(f"Unsupported SHAP value shape: {values.shape}")
 
         patch_map = np.zeros((height, width), dtype=np.float32)
@@ -91,8 +93,11 @@ class PatchSHAPExplainer:
             for gx in range(self.grid_size):
                 y0, y1 = y_edges[gy], y_edges[gy + 1]
                 x0, x1 = x_edges[gx], x_edges[gx + 1]
-                patch_idx = gy * self.grid_size + gx
-                patch_map[y0:y1, x0:x1] = values[patch_idx]
+                if values.ndim == 2:
+                    patch_map[y0:y1, x0:x1] = values[y0:y1, x0:x1].mean()
+                else:
+                    patch_idx = gy * self.grid_size + gx
+                    patch_map[y0:y1, x0:x1] = values[patch_idx]
 
         return patch_map
 
