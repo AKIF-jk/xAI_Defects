@@ -66,12 +66,7 @@ class PatchSHAPExplainer:
         logger.info("Starting SHAP explanation (n_evals=%d, grid_size=%d)", n_evals, self.grid_size)
         image_numpy = self._validate_image_numpy(image_numpy)
         h, w = image_numpy.shape[:2]
-        segment_map = self._create_segment_map(h, w)
-        masker = shap.maskers.Image(
-            "inpaint_telea",
-            image_numpy.shape,
-            clusters=segment_map,
-        )
+        masker = shap.maskers.Image("inpaint_telea", image_numpy.shape)
         explainer = shap.Explainer(self._predict, masker)
         logger.debug("Computing SHAP values with %d evaluations over %d features...", n_evals, self.grid_size ** 2)
         shap_values = explainer(image_numpy[np.newaxis], max_evals=n_evals)
