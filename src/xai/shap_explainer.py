@@ -42,6 +42,17 @@ class PatchSHAPExplainer:
         except StopIteration:
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    def _create_segment_map(self, height, width):
+        segment_map = np.zeros((height, width), dtype=np.int32)
+        y_edges = np.linspace(0, height, self.grid_size + 1, dtype=int)
+        x_edges = np.linspace(0, width, self.grid_size + 1, dtype=int)
+        for gy in range(self.grid_size):
+            for gx in range(self.grid_size):
+                y0, y1 = y_edges[gy], y_edges[gy + 1]
+                x0, x1 = x_edges[gx], x_edges[gx + 1]
+                segment_map[y0:y1, x0:x1] = gy * self.grid_size + gx
+        return segment_map
+
     def _predict(self, masked_images):
         images = self._numpy_images_to_tensor(masked_images).to(self.memory_bank.device)
         with torch.no_grad():
@@ -54,41 +65,34 @@ class PatchSHAPExplainer:
 
         logger.info("Starting SHAP explanation (n_evals=%d, grid_size=%d)", n_evals, self.grid_size)
         image_numpy = self._validate_image_numpy(image_numpy)
-        masker = shap.maskers.Image("inpaint_telea", image_numpy.shape)
+        h, w = image_numpy.shape[:2]
+        segment_map = self._create_segment_map(h, w)
+        masker = shap.maskers.Image("inpaint_telea", segment_map)
         explainer = shap.Explainer(self._predict, masker)
-        logger.debug("Computing SHAP values with %d evaluations...", n_evals)
+        logger.debug("Computing SHAP values with %d evaluations over %d features...", n_evals, self.grid_size ** 2)
         shap_values = explainer(image_numpy[np.newaxis], max_evals=n_evals)
         logger.debug("SHAP values computed, shape=%s", shap_values.values.shape)
-        shap_map = self._values_to_map(shap_values.values)
-        shap_map = self._grid_average_map(shap_map, self.grid_size)
+        shap_map = self._values_to_map(shap_values.values, h, w)
         logger.info("SHAP explanation complete")
         return shap_map.astype(np.float32)
 
-    @staticmethod
-    def _values_to_map(values):
+    def _values_to_map(self, values, height, width):
         values = np.asarray(values)
-        if values.ndim == 5:
-            values = values[..., 0]
-        if values.ndim == 4:
+        if values.ndim == 2:
             values = values[0]
-        if values.ndim == 3:
-            values = values.sum(axis=-1)
-        if values.ndim != 2:
+        if values.ndim != 1:
             raise RuntimeError(f"Unsupported SHAP value shape: {values.shape}")
-        return values
 
-    @staticmethod
-    def _grid_average_map(shap_map, grid_size):
-        h, w = shap_map.shape
-        y_edges = np.linspace(0, h, grid_size + 1, dtype=int)
-        x_edges = np.linspace(0, w, grid_size + 1, dtype=int)
-        patch_map = np.zeros_like(shap_map, dtype=np.float32)
+        patch_map = np.zeros((height, width), dtype=np.float32)
+        y_edges = np.linspace(0, height, self.grid_size + 1, dtype=int)
+        x_edges = np.linspace(0, width, self.grid_size + 1, dtype=int)
 
-        for gy in range(grid_size):
-            for gx in range(grid_size):
+        for gy in range(self.grid_size):
+            for gx in range(self.grid_size):
                 y0, y1 = y_edges[gy], y_edges[gy + 1]
                 x0, x1 = x_edges[gx], x_edges[gx + 1]
-                patch_map[y0:y1, x0:x1] = float(shap_map[y0:y1, x0:x1].mean())
+                patch_idx = gy * self.grid_size + gx
+                patch_map[y0:y1, x0:x1] = values[patch_idx]
 
         return patch_map
 
