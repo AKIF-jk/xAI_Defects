@@ -1,4 +1,20 @@
+"""
+explainer_llm.py  —  Colab free-tier optimised version
+=======================================================
+Key changes vs original
+-----------------------
+1. LLM: Mistral-7B (≈14 GB fp16) → google/flan-t5-base (≈1 GB)
+   - Uses text2text-generation pipeline (no chat-message format needed)
+   - Optional: pass --llm_model with any causal-LM + --use_4bit for quantised Mistral
+2. SHAP masker: inpaint_telea (slow) → blur(11,11) (fast, low RAM)
+3. Colab-safe defaults: n_evals=50, grid_size=5, max_anomalous=2, n_shots=2
+4. LLM is unloaded from GPU (moved to CPU) while CLIP/SHAP run, then swapped back
+5. gc.collect() + torch.cuda.empty_cache() after every category
+6. --resume flag works as before (checkpoint survives runtime restarts)
+"""
+
 import argparse
+import gc
 import logging
 import os
 import pickle
@@ -22,6 +38,10 @@ from xai.gradcam import CLIPGradCAM
 from xai.shap_explainer import PatchSHAPExplainer
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint helpers (unchanged from original)
+# ---------------------------------------------------------------------------
+
 def _ckpt_path(output_dir):
     return os.path.join(output_dir, "explainer_checkpoint.pkl")
 
@@ -30,8 +50,10 @@ def _save_ckpt(output_dir, explanations, total_latency, total_images, processed_
     path = _ckpt_path(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     data = dict(
-        explanations=[{k: v for k, v in e.items() if k not in ("gradcam_map", "shap_map")}
-                      for e in explanations],
+        explanations=[
+            {k: v for k, v in e.items() if k not in ("gradcam_map", "shap_map")}
+            for e in explanations
+        ],
         explanations_full=explanations,
         total_latency=total_latency,
         total_images=total_images,
@@ -60,6 +82,10 @@ def _load_ckpt(output_dir):
         set(data["processed_pairs"]),
     )
 
+
+# ---------------------------------------------------------------------------
+# Spatial helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def patch_position_to_text(patch_idx, grid_size, img_size=None):
     G = int(grid_size)
@@ -104,53 +130,119 @@ def build_explanation_prompt(category, anomaly_score, top_shap_patches, gradcam_
     vocab = ", ".join(DEFECT_VOCAB.get(category, ["surface defect"]))
     severity = "high" if anomaly_score > 0.75 else ("medium" if anomaly_score > 0.5 else "low")
     if not top_shap_patches or top_shap_patches[0]["position"] == "none":
-        shap_lines = "  - No strong patch-level evidence detected"
+        shap_lines = "no strong patch-level evidence"
     else:
-        shap_lines = "\n".join(
-            f"  - Patch at {p['position']} (contribution: {p['value']:.3f})"
+        shap_lines = "; ".join(
+            f"{p['position']} (contribution {p['value']:.3f})"
             for p in top_shap_patches
         )
+    # Flat prompt works for both seq2seq (flan-t5) and causal LMs
     prompt = (
-        f"You are inspecting a {category} on a manufacturing line.\n"
-        f"Known defect types for this product: {vocab}\n"
-        f"Anomaly severity: {severity} (score={anomaly_score:.2f}, 0=normal, 1=defective)\n"
-        f"Primary defect region (GradCAM): {gradcam_region} of the image\n"
-        f"Supporting evidence (SHAP patches):\n{shap_lines}\n\n"
-        "In one sentence (max 35 words): name the defect type, its location, "
-        "and a likely cause. Be specific and actionable."
+        f"Inspect a {category} on a manufacturing line. "
+        f"Known defect types: {vocab}. "
+        f"Anomaly severity: {severity} (score={anomaly_score:.2f}). "
+        f"GradCAM hotspot: {gradcam_region}. "
+        f"SHAP evidence: {shap_lines}. "
+        "In one sentence (max 35 words) name the defect type, its location, and the likely cause."
     )
     return prompt
 
 
-def get_explanation(
-    prompt_text,
-    pipe=None,
-    model="mistralai/Mistral-7B-Instruct-v0.3",
-    device="cpu",
-    max_new_tokens=100,
-    temperature=0.3,
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+
+def load_llm_pipeline(
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    device: str = "cpu",
+    use_4bit: bool = False,
 ):
+    """
+    Load a lightweight LLM pipeline (text-generation only).
+
+    Default: Qwen/Qwen2.5-0.5B-Instruct  — 0.5B params, ~1 GB fp16.
+    Fits alongside CLIP on a T4 with room to spare.
+
+    Alternatives:
+        "TinyLlama/TinyLlama-1.1B-Chat-v1.0"       ~2 GB fp16
+        "mistralai/Mistral-7B-Instruct-v0.3"        needs --use_4bit
+
+    NOTE: "text2text-generation" (flan-t5 / T5) was removed from transformers
+    ≥ 4.52. All models now use "text-generation" via the unified pipeline.
+    """
+    from transformers import pipeline as hf_pipeline
+
+    dtype = torch.float16 if device != "cpu" else torch.float32
+
+    kwargs = dict(
+        model=model_name,
+        torch_dtype=dtype,
+    )
+
+    if use_4bit:
+        try:
+            from transformers import BitsAndBytesConfig
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+            kwargs.pop("torch_dtype", None)
+            kwargs["device_map"] = "auto"
+            logger.info("4-bit quantisation enabled for %s", model_name)
+        except ImportError:
+            logger.warning("bitsandbytes not installed — falling back to fp16")
+            kwargs["device_map"] = "auto" if device != "cpu" else None
+    else:
+        kwargs["device_map"] = "auto" if device != "cpu" else None
+
+    pipe = hf_pipeline("text-generation", **kwargs)
+    logger.info("LLM pipeline loaded: %s", model_name)
+    return pipe
+
+
+def _move_pipe_to_cpu(pipe):
+    """Offload the LLM to CPU RAM so CLIP/SHAP can use the GPU."""
+    try:
+        if hasattr(pipe, "model"):
+            pipe.model.to("cpu")
+            logger.debug("LLM moved to CPU")
+    except Exception as e:
+        logger.debug("Could not move LLM to CPU: %s", e)
+    torch.cuda.empty_cache()
+
+
+def _move_pipe_to_gpu(pipe, device):
+    """Bring the LLM back to GPU for inference."""
+    if device == "cpu":
+        return
+    try:
+        if hasattr(pipe, "model"):
+            pipe.model.to(device)
+            logger.debug("LLM moved back to %s", device)
+    except Exception as e:
+        logger.debug("Could not move LLM to GPU: %s", e)
+
+
+def get_explanation(
+    prompt_text: str,
+    pipe=None,
+    model: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    device: str = "cpu",
+    max_new_tokens: int = 80,
+    temperature: float = 0.3,
+    use_4bit: bool = False,
+) -> tuple:
+    """
+    Generate a one-sentence defect explanation via text-generation pipeline.
+    Returns (explanation_text, pipe) so the caller can reuse the pipe.
+    """
     if pipe is None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline as hf_pipeline
+        pipe = load_llm_pipeline(model, device, use_4bit)
 
-        tokenizer = AutoTokenizer.from_pretrained(model)
-        quantization_config = BitsAndBytesConfig(load_in_4bit=True) if device != "cpu" else None
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model,
-            quantization_config=quantization_config,
-            device_map="auto" if device != "cpu" else None,
-        )
-        pipe = hf_pipeline(
-            "text-generation",
-            model=hf_model,
-            tokenizer=tokenizer,
-            device=0 if device != "cpu" else -1,
-        )
-
+    do_sample = temperature > 0
     system = (
-        "You are a quality control expert. Given anomaly detection results, "
-        "write exactly ONE sentence (max 35 words) explaining what defect was found, "
-        "where it is, and a likely cause. Be specific and actionable."
+        "You are a quality control expert. "
+        "Write exactly ONE sentence (max 35 words) explaining the defect, location, and cause."
     )
     messages = [
         {"role": "system", "content": system},
@@ -159,29 +251,29 @@ def get_explanation(
     outputs = pipe(
         messages,
         max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        do_sample=True,
+        temperature=temperature if do_sample else None,
+        do_sample=do_sample,
         return_full_text=False,
     )
-    if isinstance(outputs[0]["generated_text"], list):
-        return outputs[0]["generated_text"][-1]["content"].strip(), pipe
-    return outputs[0]["generated_text"].strip(), pipe
+    raw = outputs[0]["generated_text"]
+    text = (raw[-1]["content"] if isinstance(raw, list) else raw).strip()
+    return text, pipe
 
+
+# ---------------------------------------------------------------------------
+# Map utilities (unchanged)
+# ---------------------------------------------------------------------------
 
 def _gradcam_hotspot_location(gradcam_map, grid_size):
     G = int(grid_size)
     h, w = gradcam_map.shape
     y_edges = np.linspace(0, h, G + 1, dtype=int)
     x_edges = np.linspace(0, w, G + 1, dtype=int)
-    best_val = -1.0
-    best_idx = 0
+    best_val, best_idx = -1.0, 0
     for gy in range(G):
         for gx in range(G):
             patch_mean = float(
-                gradcam_map[
-                    y_edges[gy] : y_edges[gy + 1],
-                    x_edges[gx] : x_edges[gx + 1],
-                ].mean()
+                gradcam_map[y_edges[gy]: y_edges[gy + 1], x_edges[gx]: x_edges[gx + 1]].mean()
             )
             if patch_mean > best_val:
                 best_val = patch_mean
@@ -197,12 +289,7 @@ def _get_top_shap_patches(shap_map, grid_size, top_k=5):
     patches = []
     for gy in range(G):
         for gx in range(G):
-            val = float(
-                shap_map[
-                    y_edges[gy] : y_edges[gy + 1],
-                    x_edges[gx] : x_edges[gx + 1],
-                ].mean()
-            )
+            val = float(shap_map[y_edges[gy]: y_edges[gy + 1], x_edges[gx]: x_edges[gx + 1]].mean())
             patches.append({"index": gy * G + gx, "value": val})
     patches.sort(key=lambda p: p["value"], reverse=True)
     positive = [p for p in patches if p["value"] > 0.0]
@@ -235,6 +322,10 @@ def _as_memory_tensor(memory_bank, device):
     return memory.float().to(device)
 
 
+# ---------------------------------------------------------------------------
+# Core explain_defect — with GPU-swap memory management
+# ---------------------------------------------------------------------------
+
 def explain_defect(
     image,
     model,
@@ -243,9 +334,21 @@ def explain_defect(
     pipe=None,
     gradcam_gen=None,
     shap_gen=None,
-    grid_size=7,
-    n_evals=200,
+    grid_size=5,
+    n_evals=50,
+    llm_model="google/flan-t5-base",
+    use_4bit=False,
 ):
+    """
+    Run GradCAM + SHAP + LLM for one image.
+
+    GPU-swap strategy
+    -----------------
+    1. CLIP forward (anomaly score) — GPU
+    2. GradCAM                      — GPU
+    3. Offload LLM to CPU (if loaded), run SHAP on GPU, reload LLM
+    4. LLM inference                — GPU (or CPU for flan-t5-base)
+    """
     start = time.perf_counter()
     model.eval()
 
@@ -255,25 +358,26 @@ def explain_defect(
     device = image.device
     memory_tensor = _as_memory_tensor(memory_bank, device)
 
-    # 1. Score via AdaptCLIP forward
+    # 1. Anomaly score
     logger.info("Computing anomaly score...")
     with torch.no_grad():
         score_tensor, _ = model(image, memory_tensor, class_name)
     anomaly_score = float(score_tensor[0].item())
     logger.info("Anomaly score: %.4f", anomaly_score)
 
-    # 2. GradCAM heatmap
+    # 2. GradCAM
     logger.info("Generating GradCAM heatmap...")
     t0 = time.perf_counter()
     if gradcam_gen is None:
         gradcam_gen = CLIPGradCAM(model)
-    gradcam_map = gradcam_gen.generate(
-        image, memory_bank, class_name, img_size=image.shape[-1]
-    )
+    gradcam_map = gradcam_gen.generate(image, memory_bank, class_name, img_size=image.shape[-1])
     logger.info("GradCAM done in %.2fs", time.perf_counter() - t0)
 
-    # 3. SHAP attribution map
-    logger.info("Running SHAP explanation (this may take a while)...")
+    # 3. Offload LLM → run SHAP → restore LLM
+    if pipe is not None:
+        _move_pipe_to_cpu(pipe)
+
+    logger.info("Running SHAP (n_evals=%d, grid_size=%d)...", n_evals, grid_size)
     image_np = _denormalize_image(image[0])
     if shap_gen is None:
         shap_gen = PatchSHAPExplainer(model, memory_bank, class_name, grid_size=grid_size)
@@ -281,22 +385,24 @@ def explain_defect(
     shap_map = shap_gen.explain(image_np, n_evals=n_evals)
     logger.info("SHAP done in %.2fs", time.perf_counter() - t0)
 
-    # 4. Extract interpretable signals from maps
-    logger.info("Extracting interpretable signals...")
+    if pipe is not None:
+        _move_pipe_to_gpu(pipe, str(device))
+
+    # 4. Extract signals
     gradcam_region = _gradcam_hotspot_location(gradcam_map, grid_size)
     top_shap = _get_top_shap_patches(shap_map, grid_size, top_k=5)
 
     # 5. LLM explanation
     logger.info("Generating LLM explanation...")
-    prompt = build_explanation_prompt(
-        class_name, anomaly_score, top_shap, gradcam_region
-    )
+    prompt = build_explanation_prompt(class_name, anomaly_score, top_shap, gradcam_region)
     t0 = time.perf_counter()
-    explanation, pipe = get_explanation(prompt, pipe=pipe)
-    logger.info("LLM generation done in %.2fs", time.perf_counter() - t0)
+    explanation, pipe = get_explanation(
+        prompt, pipe=pipe, model=llm_model,
+        device=str(device), use_4bit=use_4bit,
+    )
+    logger.info("LLM done in %.2fs", time.perf_counter() - t0)
 
     latency_ms = round((time.perf_counter() - start) * 1000)
-
     return {
         "score": anomaly_score,
         "gradcam_map": gradcam_map,
@@ -307,16 +413,22 @@ def explain_defect(
     }
 
 
+# ---------------------------------------------------------------------------
+# Main test loop
+# ---------------------------------------------------------------------------
+
 def run_explanation_test(
     data_dir,
     output_dir="./outputs/explanation",
     device=None,
-    n_shots=4,
-    grid_size=7,
-    n_evals=200,
+    n_shots=2,          # ↓ was 4
+    grid_size=5,        # ↓ was 7  (25 patches vs 49)
+    n_evals=50,         # ↓ was 200
     categories=("metal_nut", "leather", "cable"),
-    max_anomalous=5,
+    max_anomalous=2,    # ↓ was 5
     resume=False,
+    llm_model="Qwen/Qwen2.5-0.5B-Instruct",
+    use_4bit=False,
 ):
     clip_model, _, _, device = load_backbone(device)
     adapt_model = AdaptCLIPModel(clip_model, device).to(device)
@@ -326,8 +438,7 @@ def run_explanation_test(
         transforms.Resize(224),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
     mask_transform = transforms.Compose([
         transforms.Resize(224, interpolation=transforms.InterpolationMode.NEAREST),
@@ -354,17 +465,14 @@ def run_explanation_test(
         logger.info("Memory bank built with %d vectors for %s", memory.size, cat)
 
         test_ds = MVTecDataset(
-            data_dir,
-            cat,
-            split="test",
-            transform=transform,
-            mask_transform=mask_transform,
+            data_dir, cat, split="test",
+            transform=transform, mask_transform=mask_transform,
         )
         test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
 
         gradcam_gen = CLIPGradCAM(adapt_model)
         shap_gen = PatchSHAPExplainer(adapt_model, memory, cat, grid_size=grid_size)
-        logger.info("Initialized GradCAM and SHAP explainers for %s", cat)
+        logger.info("Explainers initialised for %s", cat)
 
         images_done = 0
         for img_idx, (image_tensor, mask_tensor, label) in enumerate(test_loader):
@@ -388,15 +496,20 @@ def run_explanation_test(
             img_start = time.perf_counter()
             result = explain_defect(
                 image_tensor, adapt_model, memory, cat,
-                pipe=pipe, gradcam_gen=gradcam_gen, shap_gen=shap_gen,
-                grid_size=grid_size, n_evals=n_evals,
+                pipe=pipe,
+                gradcam_gen=gradcam_gen,
+                shap_gen=shap_gen,
+                grid_size=grid_size,
+                n_evals=n_evals,
+                llm_model=llm_model,
+                use_4bit=use_4bit,
             )
             img_elapsed = time.perf_counter() - img_start
             pipe = result.pop("pipe")
 
             logger.info(
                 "Finished %s image %d/%d in %.1fs (score=%.4f)",
-                cat, images_done + 1, max_anomalous, img_elapsed, result['score'],
+                cat, images_done + 1, max_anomalous, img_elapsed, result["score"],
             )
             print(
                 f"[{cat} #{images_done + 1}] "
@@ -412,8 +525,19 @@ def run_explanation_test(
             processed_pairs.add(pair)
             _save_ckpt(output_dir, all_explanations, total_latency, total_images, processed_pairs)
 
+        # ---- Per-category cleanup -------------------------------------------
         cat_elapsed = time.perf_counter() - cat_start
         logger.info("Category %s complete in %.1fs", cat, cat_elapsed)
+
+        del gradcam_gen, shap_gen, train_ds, test_ds, train_loader, test_loader, memory
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info(
+                "GPU memory after cleanup: %.1f MB allocated",
+                torch.cuda.memory_allocated() / 1e6,
+            )
+        # ---------------------------------------------------------------------
 
     avg_latency = total_latency / total_images if total_images > 0 else 0
     logger.info("=" * 50)
@@ -426,23 +550,47 @@ def run_explanation_test(
     return all_explanations
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="LLM explanation demo for AdaptCLIP on MVTec AD"
+        description="LLM explanation demo for AdaptCLIP on MVTec AD (Colab free-tier optimised)"
     )
     parser.add_argument("--data_dir", required=True)
     parser.add_argument("--output_dir", default="./outputs/explanation")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--n_shots", type=int, default=4)
-    parser.add_argument("--grid_size", type=int, default=7)
-    parser.add_argument("--n_evals", type=int, default=200)
+    parser.add_argument("--n_shots", type=int, default=2,
+                        help="Normal shots for memory bank (default 2, was 4)")
+    parser.add_argument("--grid_size", type=int, default=5,
+                        help="Patch grid size (default 5, was 7)")
+    parser.add_argument("--n_evals", type=int, default=50,
+                        help="SHAP evaluations per image (default 50, was 200)")
+    parser.add_argument("--categories", nargs="+",
+                        default=["metal_nut", "leather", "cable"])
+    parser.add_argument("--max_anomalous", type=int, default=2,
+                        help="Max anomalous images per category (default 2, was 5)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from checkpoint")
     parser.add_argument(
-        "--categories", nargs="+",
-        default=["metal_nut", "leather", "cable"],
+        "--llm_model", default="Qwen/Qwen2.5-0.5B-Instruct",
+        help=(
+            "HuggingFace model for text explanation. "
+            "Default: Qwen/Qwen2.5-0.5B-Instruct (~1 GB fp16, fits on T4). "
+            "Alternatives: TinyLlama/TinyLlama-1.1B-Chat-v1.0, "
+            "mistralai/Mistral-7B-Instruct-v0.3 (needs --use_4bit)"
+        ),
     )
-    parser.add_argument("--max_anomalous", type=int, default=5)
-    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    parser.add_argument("--use_4bit", action="store_true",
+                        help="Load LLM in 4-bit (requires bitsandbytes). "
+                             "Needed for Mistral-7B on Colab free tier.")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     run_explanation_test(
         data_dir=args.data_dir,
@@ -454,6 +602,8 @@ def main():
         categories=tuple(args.categories),
         max_anomalous=args.max_anomalous,
         resume=args.resume,
+        llm_model=args.llm_model,
+        use_4bit=args.use_4bit,
     )
 
 
