@@ -109,6 +109,12 @@ def _generate_score_map_overlay(image_tensor, model, memory_tensor, class_name, 
     patch_tokens = patch_feats[0, 1:]  # drop CLS token
     if patch_tokens.numel() == 0:
         return None
+
+    if patch_tokens.shape[-1] != memory_tensor.shape[-1]:
+        proj = getattr(model.clip_model.visual, "proj", None)
+        if proj is not None:
+            patch_tokens = patch_tokens @ proj.detach().to(patch_tokens.device)
+
     scores = compute_patch_scores(patch_tokens, memory_tensor, metric="cosine", top_k=3)
     heatmap = scores_to_heatmap(scores, img_size=img_size, patch_size=14, sigma=4.0)
     original_np = _denormalize_image(image_tensor[0])
@@ -458,9 +464,7 @@ def generate_gallery(
         train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
         memory = MemoryBank(feat_dim=768, mode="global")
         memory.build(clip_model, train_loader, n_shots, device)
-        memory_tensor = torch.from_numpy(
-            memory.index.reconstruct_n(0, memory.index.ntotal)
-        ).to(device)
+        patch_memory_tensor = memory.get_patch_bank().to(device)
         logger.info("Memory bank: %d vectors for %s", memory.size, cat)
 
         # Load test set
@@ -524,7 +528,7 @@ def generate_gallery(
 
             # Generate score map overlay
             score_overlay = _generate_score_map_overlay(
-                image_tensor, adapt_model, memory_tensor, cat, IMG_SIZE
+                image_tensor, adapt_model, patch_memory_tensor, cat, IMG_SIZE
             )
 
             # Denormalize original
