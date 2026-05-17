@@ -293,15 +293,6 @@ def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation
     axes[3].set_title("SHAP (7x7 fast)", fontsize=10)
     axes[3].axis("off")
 
-    # Draw white grid lines at patch boundaries (7x7 grid on 224x224 = 32px per patch)
-    h, w = original_np.shape[:2]
-    patch_h, patch_w = h / 7, w / 7
-    for i in range(1, 7):
-        y = int(i * patch_h)
-        x = int(i * patch_w)
-        axes[3].axhline(y, color="white", linewidth=0.8, alpha=0.7)
-        axes[3].axvline(x, color="white", linewidth=0.8, alpha=0.7)
-
     # Explanation text below
     status = (
         "TP" if (true_label == 1 and anomaly_score >= ANOMALY_THRESHOLD) else
