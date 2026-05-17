@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import pickle
 import sys
 import time
 
@@ -175,6 +176,43 @@ def visualize_shap(image, shap_map, top_k=5, grid_size=None):
     return np.asarray(annotated)
 
 
+def _checkpoint_path(output_dir):
+    return os.path.join(output_dir, "checkpoint.pkl")
+
+
+def _save_checkpoint(output_dir, rows, processed_indices, anomalous_count, normal_count):
+    path = _checkpoint_path(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    data = dict(
+        rows=rows,
+        processed_indices=processed_indices,
+        anomalous_count=anomalous_count,
+        normal_count=normal_count,
+    )
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+    logger.info("Checkpoint saved to %s", path)
+
+
+def _load_checkpoint(output_dir):
+    path = _checkpoint_path(output_dir)
+    if not os.path.exists(path):
+        logger.info("No checkpoint found at %s", path)
+        return None, set(), 0, 0
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    logger.info(
+        "Loaded checkpoint from %s (%d images processed)",
+        path, len(data["rows"]),
+    )
+    return (
+        data["rows"],
+        set(data["processed_indices"]),
+        data["anomalous_count"],
+        data["normal_count"],
+    )
+
+
 def run_leather_shap_test(
     data_dir,
     output_dir="./outputs/shap",
@@ -182,6 +220,7 @@ def run_leather_shap_test(
     n_shots=8,
     grid_size=7,
     n_evals=200,
+    resume=False,
 ):
     clip_model, _, _, device = load_backbone(device)
     adapt_model = AdaptCLIPModel(clip_model, device).to(device)
@@ -217,12 +256,19 @@ def run_leather_shap_test(
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
     explainer = PatchSHAPExplainer(adapt_model, memory, "leather", grid_size=grid_size)
 
-    rows = []
-    anomalous_count = 0
-    normal_count = 0
+    if resume:
+        rows, processed_indices, anomalous_count, normal_count = _load_checkpoint(output_dir)
+    else:
+        rows, processed_indices, anomalous_count, normal_count = [], set(), 0, 0
+
     for idx, (image_tensor, mask_tensor, label) in enumerate(test_loader):
         label_int = int(label.item())
         kind = "anomalous" if label_int == 1 else "normal"
+
+        if idx in processed_indices:
+            logger.info("Skipping already-processed image %d (%s)", idx, kind)
+            continue
+
         if label_int == 1:
             if anomalous_count >= 3:
                 continue
@@ -246,7 +292,6 @@ def run_leather_shap_test(
         best_overlap_value = _best_gt_overlap_patch_value(shap_map, mask_np, grid_size)
 
         logger.info("Finished %s image %d in %.2fs", kind, idx, runtime)
-        kind = "anomalous" if label_int == 1 else "normal"
         if np.isnan(best_overlap_value):
             print(
                 f"{kind} image {len(rows) + 1}: no GT defect mask, "
@@ -259,6 +304,9 @@ def run_leather_shap_test(
             )
 
         rows.append((image_np.astype(np.uint8), heatmap, annotated, mask_np.astype(np.float32)))
+        processed_indices.add(idx)
+        _save_checkpoint(output_dir, rows, processed_indices, anomalous_count, normal_count)
+
         if anomalous_count >= 3 and normal_count >= 2:
             break
 
@@ -356,6 +404,7 @@ def main():
     parser.add_argument("--n_shots", type=int, default=8)
     parser.add_argument("--grid_size", type=int, default=7)
     parser.add_argument("--n_evals", type=int, default=200)
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     args = parser.parse_args()
 
     run_leather_shap_test(
@@ -365,6 +414,7 @@ def main():
         n_shots=args.n_shots,
         grid_size=args.grid_size,
         n_evals=args.n_evals,
+        resume=args.resume,
     )
 
 
