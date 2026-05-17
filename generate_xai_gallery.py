@@ -137,17 +137,14 @@ def _extract_patch_features(clip_model, image_tensor):
     return global_feat, patch_feats[0, 1:, :]
 
 
-def _build_patch_calibration(clip_model, train_loader, n_shots, patch_memory_tensor, device):
-    """Build Z-score calibration stats from normal training images.
+def _build_patch_calibration(clip_model, calib_loader, patch_memory_tensor, device, normal_percentile=95):
+    """Build Z-score calibration stats from a disjoint set of normal images.
 
-    Matches _build_patch_calibration() in full_evaluation.py exactly.
-    Returns (center, scale) arrays for per-patch Z-score calibration.
+    Unlike the memory bank (built from support set), this uses a separate
+    calibration set to avoid overfitting. Returns (center, scale, global_max).
     """
     scores = []
-    count = 0
-    for images, _ in train_loader:
-        if count >= n_shots:
-            break
+    for images, _ in calib_loader:
         image = images.to(device)
         _, query_patches = _extract_patch_features(clip_model, image)
         if query_patches is None:
@@ -159,7 +156,6 @@ def _build_patch_calibration(clip_model, train_loader, n_shots, patch_memory_ten
             top_k=3,
         )
         scores.append(patch_scores.detach().cpu().numpy())
-        count += images.size(0)
 
     if not scores:
         raise RuntimeError("No normal calibration scores collected")
@@ -171,10 +167,18 @@ def _build_patch_calibration(clip_model, train_loader, n_shots, patch_memory_ten
     positive_scale = scale[scale > 0]
     scale_floor = np.percentile(positive_scale, 10) if positive_scale.size else 1e-6
     scale = np.maximum(scale, max(float(scale_floor), 1e-6))
-    return center, scale
+    
+    # Compute global_max for score normalization (matches full_evaluation.py:255)
+    all_normal_z = (normal_matrix - center) / scale
+    all_normal_z = np.clip(all_normal_z, 0, None)
+    baseline = np.quantile(all_normal_z, 0.5, axis=1, keepdims=True)
+    calibrated = np.clip(all_normal_z - baseline, 0, None)
+    global_max = max(float(np.percentile(calibrated, normal_percentile)), 1.0)
+    
+    return center, scale, global_max
 
 
-def _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, normal_scale, baseline_quantile=0.5):
+def _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, normal_scale, global_max, baseline_quantile=0.5):
     """Calibrate patch scores and return image-level anomaly score.
 
     Matches the few-shot scoring in full_evaluation.py exactly:
@@ -182,6 +186,7 @@ def _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, norm
     2. Z-score calibrate against normal stats
     3. Subtract baseline (median of Z-scores)
     4. Image score = 95th percentile of calibrated patch scores
+    5. Normalize by global_max to [0, 1] range
     """
     raw_scores = compute_patch_scores(
         query_patches,
@@ -198,15 +203,18 @@ def _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, norm
 
     # Image-level score: 95th percentile of calibrated patch scores
     score = float(torch.quantile(calibrated, 0.95).detach().cpu())
+    
+    # Normalize to [0, 1] range (matches full_evaluation.py:297)
+    score = min(score / global_max, 1.0)
     return score
 
 
 def _compute_anomaly_score(
-    image_tensor, clip_model, patch_memory_tensor, normal_center, normal_scale, device
+    image_tensor, clip_model, patch_memory_tensor, normal_center, normal_scale, global_max, device
 ):
     """Full scoring pipeline matching full_evaluation.py few-shot mode.
 
-    Returns a float anomaly score where higher = more anomalous.
+    Returns a float anomaly score in [0, 1] where higher = more anomalous.
     Uses calibrated patch-level cosine distances with 95th percentile aggregation.
     """
     if image_tensor.dim() == 3:
@@ -217,7 +225,7 @@ def _compute_anomaly_score(
     if query_patches is None:
         return 0.0
 
-    return _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, normal_scale)
+    return _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, normal_scale, global_max)
 
 
 def _generate_score_map_overlay(image_tensor, clip_model, patch_memory_tensor, img_size=IMG_SIZE):
@@ -578,19 +586,25 @@ def generate_gallery(
         logger.info("=" * 60)
         cat_start = time.perf_counter()
 
-        # Build memory bank
+        # Build memory bank from support set (first n_shots images)
         train_ds = MVTecDataset(data_dir, cat, split="train", transform=transform)
         train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
         memory = MemoryBank(feat_dim=768, mode="global")
         memory.build(clip_model, train_loader, n_shots, device)
         patch_memory_tensor = memory.get_patch_bank().to(device)
-        logger.info("Memory bank: %d vectors for %s", memory.size, cat)
+        logger.info("Memory bank: %d vectors for %s (support set: first %d images)", memory.size, cat, n_shots)
 
-        # Build Z-score calibration from normal training images (matches full_evaluation.py)
-        normal_center, normal_scale = _build_patch_calibration(
-            clip_model, train_loader, n_shots, patch_memory_tensor, device
+        # Build calibration stats from disjoint set (skip first n_shots images)
+        calib_indices = list(range(n_shots, len(train_ds)))
+        calib_subset = torch.utils.data.Subset(train_ds, calib_indices)
+        calib_loader = DataLoader(calib_subset, batch_size=1, shuffle=False)
+        normal_center, normal_scale, global_max = _build_patch_calibration(
+            clip_model, calib_loader, patch_memory_tensor, device
         )
-        logger.info("Patch calibration built for %s (center shape=%s)", cat, normal_center.shape)
+        logger.info(
+            "Patch calibration built for %s (calibration set: %d images, global_max=%.4f)",
+            cat, len(calib_indices), global_max
+        )
 
         # Load test set
         test_ds = MVTecDataset(
@@ -637,7 +651,7 @@ def generate_gallery(
                 # Scoring: calibrated patch-level cosine distance (matches full_evaluation.py few-shot)
                 anomaly_score = _compute_anomaly_score(
                     image_tensor, clip_model, patch_memory_tensor,
-                    normal_center, normal_scale, device,
+                    normal_center, normal_scale, global_max, device,
                 )
             except Exception as e:
                 logger.error("Failed on %s idx %d: %s", cat, ds_idx, e)

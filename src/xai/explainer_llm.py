@@ -462,7 +462,7 @@ def run_explanation_test(
         train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
         memory = MemoryBank(feat_dim=768, mode="global")
         memory.build(clip_model, train_loader, n_shots, device)
-        logger.info("Memory bank built with %d vectors for %s", memory.size, cat)
+        logger.info("Memory bank built with %d vectors for %s (support set: first %d images)", memory.size, cat, n_shots)
 
         test_ds = MVTecDataset(
             data_dir, cat, split="test",
