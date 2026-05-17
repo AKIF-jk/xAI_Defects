@@ -216,32 +216,44 @@ def explain_defect(
     memory_tensor = _as_memory_tensor(memory_bank, device)
 
     # 1. Score via AdaptCLIP forward
+    logger.info("Computing anomaly score...")
     with torch.no_grad():
         score_tensor, _ = model(image, memory_tensor, class_name)
     anomaly_score = float(score_tensor[0].item())
+    logger.info("Anomaly score: %.4f", anomaly_score)
 
     # 2. GradCAM heatmap
+    logger.info("Generating GradCAM heatmap...")
+    t0 = time.perf_counter()
     if gradcam_gen is None:
         gradcam_gen = CLIPGradCAM(model)
     gradcam_map = gradcam_gen.generate(
         image, memory_bank, class_name, img_size=image.shape[-1]
     )
+    logger.info("GradCAM done in %.2fs", time.perf_counter() - t0)
 
     # 3. SHAP attribution map
+    logger.info("Running SHAP explanation (this may take a while)...")
     image_np = _denormalize_image(image[0])
     if shap_gen is None:
         shap_gen = PatchSHAPExplainer(model, memory_bank, class_name, grid_size=grid_size)
+    t0 = time.perf_counter()
     shap_map = shap_gen.explain(image_np, n_evals=n_evals)
+    logger.info("SHAP done in %.2fs", time.perf_counter() - t0)
 
     # 4. Extract interpretable signals from maps
+    logger.info("Extracting interpretable signals...")
     gradcam_region = _gradcam_hotspot_location(gradcam_map, grid_size)
     top_shap = _get_top_shap_patches(shap_map, grid_size, top_k=5)
 
     # 5. LLM explanation
+    logger.info("Generating LLM explanation...")
     prompt = build_explanation_prompt(
         class_name, anomaly_score, top_shap, gradcam_region
     )
+    t0 = time.perf_counter()
     explanation, pipe = get_explanation(prompt, pipe=pipe)
+    logger.info("LLM generation done in %.2fs", time.perf_counter() - t0)
 
     latency_ms = round((time.perf_counter() - start) * 1000)
 
@@ -287,8 +299,12 @@ def run_explanation_test(
     total_images = 0
 
     pipe = None
-    for cat in categories:
-        logger.info("Processing category: %s", cat)
+    for cat_idx, cat in enumerate(categories):
+        logger.info("=" * 50)
+        logger.info("Category %d/%d: %s", cat_idx + 1, len(categories), cat)
+        logger.info("=" * 50)
+        cat_start = time.perf_counter()
+
         train_ds = MVTecDataset(data_dir, cat, split="train", transform=transform)
         train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
         memory = MemoryBank(feat_dim=768, mode="global")
@@ -306,22 +322,34 @@ def run_explanation_test(
 
         gradcam_gen = CLIPGradCAM(adapt_model)
         shap_gen = PatchSHAPExplainer(adapt_model, memory, cat, grid_size=grid_size)
+        logger.info("Initialized GradCAM and SHAP explainers for %s", cat)
 
         images_done = 0
-        for image_tensor, mask_tensor, label in test_loader:
+        for img_idx, (image_tensor, mask_tensor, label) in enumerate(test_loader):
             if int(label.item()) != 1:
                 continue
             if images_done >= max_anomalous:
+                logger.info("Reached max %d anomalous images for %s", max_anomalous, cat)
                 break
 
+            logger.info(
+                "Processing anomalous image %d/%d for %s (dataset idx %d)...",
+                images_done + 1, max_anomalous, cat, img_idx,
+            )
             image_tensor = image_tensor.to(device)
+            img_start = time.perf_counter()
             result = explain_defect(
                 image_tensor, adapt_model, memory, cat,
                 pipe=pipe, gradcam_gen=gradcam_gen, shap_gen=shap_gen,
                 grid_size=grid_size, n_evals=n_evals,
             )
+            img_elapsed = time.perf_counter() - img_start
             pipe = result.pop("pipe")
 
+            logger.info(
+                "Finished %s image %d/%d in %.1fs (score=%.4f)",
+                cat, images_done + 1, max_anomalous, img_elapsed, result['score'],
+            )
             print(
                 f"[{cat} #{images_done + 1}] "
                 f"score={result['score']:.4f} "
@@ -334,7 +362,14 @@ def run_explanation_test(
             total_images += 1
             images_done += 1
 
+        cat_elapsed = time.perf_counter() - cat_start
+        logger.info("Category %s complete in %.1fs", cat, cat_elapsed)
+
     avg_latency = total_latency / total_images if total_images > 0 else 0
+    logger.info("=" * 50)
+    logger.info("SUMMARY: %d images across %d categories", total_images, len(categories))
+    logger.info("Average latency: %.0fms  |  Total: %.0fms", avg_latency, total_latency)
+    logger.info("=" * 50)
     print(f"\nTotal images: {total_images}")
     print(f"Average latency: {avg_latency:.0f}ms")
     print(f"Total latency: {total_latency:.0f}ms")
