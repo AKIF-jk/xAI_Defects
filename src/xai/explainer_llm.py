@@ -38,18 +38,46 @@ def patch_position_to_text(patch_idx, grid_size, img_size=None):
     return "center"
 
 
+DEFECT_VOCAB = {
+    "bottle": ["broken large", "broken small", "contamination"],
+    "cable": ["bent wire", "cable swap", "cut inner", "cut outer",
+              "missing cable", "missing wire", "poke insulation"],
+    "capsule": ["crack", "faulty imprint", "poke", "scratch", "squeeze"],
+    "carpet": ["color stain", "cut", "hole", "metal contamination", "thread"],
+    "grid": ["bent", "broken", "glue contamination", "metal contamination", "thread"],
+    "hazelnut": ["crack", "cut", "hole", "print defect"],
+    "leather": ["color stain", "cut", "fold", "glue contamination", "poke hole"],
+    "metal_nut": ["bent", "color defect", "flip", "scratch"],
+    "pill": ["color defect", "contamination", "crack", "faulty imprint", "scratch"],
+    "screw": ["manipulated front", "scratch head", "scratch neck",
+              "thread side defect", "thread top defect"],
+    "tile": ["crack", "glue strip", "gray stroke", "oil", "rough surface"],
+    "toothbrush": ["defective bristles", "deformed body"],
+    "transistor": ["bent lead", "cut lead", "damaged case", "misplaced"],
+    "wood": ["color defect", "hole", "liquid stain", "scratch"],
+    "zipper": ["broken teeth", "fabric border defect", "fabric interior defect",
+               "rough surface", "split teeth", "squeezed teeth"],
+}
+
+
 def build_explanation_prompt(category, anomaly_score, top_shap_patches, gradcam_region):
-    shap_lines = "\n".join(
-        f"  - Patch at {p['position']} (contribution: {p['value']:.3f})"
-        for p in top_shap_patches
-    )
+    vocab = ", ".join(DEFECT_VOCAB.get(category, ["surface defect"]))
+    severity = "high" if anomaly_score > 0.75 else ("medium" if anomaly_score > 0.5 else "low")
+    if not top_shap_patches or top_shap_patches[0]["position"] == "none":
+        shap_lines = "  - No strong patch-level evidence detected"
+    else:
+        shap_lines = "\n".join(
+            f"  - Patch at {p['position']} (contribution: {p['value']:.3f})"
+            for p in top_shap_patches
+        )
     prompt = (
-        f"Product category: {category}\n"
-        f"Anomaly score: {anomaly_score:.2f} (0 = normal, 1 = defective)\n"
-        f"GradCAM hotspot: {gradcam_region}\n"
-        f"Top SHAP-contributing patches:\n{shap_lines}\n\n"
-        "Based on the above, what defect is present, where is it located, "
-        "and what is a likely cause?"
+        f"You are inspecting a {category} on a manufacturing line.\n"
+        f"Known defect types for this product: {vocab}\n"
+        f"Anomaly severity: {severity} (score={anomaly_score:.2f}, 0=normal, 1=defective)\n"
+        f"Primary defect region (GradCAM): {gradcam_region} of the image\n"
+        f"Supporting evidence (SHAP patches):\n{shap_lines}\n\n"
+        "In one sentence (max 35 words): name the defect type, its location, "
+        "and a likely cause. Be specific and actionable."
     )
     return prompt
 
@@ -96,8 +124,8 @@ def get_explanation(
         return_full_text=False,
     )
     if isinstance(outputs[0]["generated_text"], list):
-        return outputs[0]["generated_text"][-1]["content"].strip()
-    return outputs[0]["generated_text"].strip()
+        return outputs[0]["generated_text"][-1]["content"].strip(), pipe
+    return outputs[0]["generated_text"].strip(), pipe
 
 
 def _gradcam_hotspot_location(gradcam_map, grid_size):
@@ -137,9 +165,12 @@ def _get_top_shap_patches(shap_map, grid_size, top_k=5):
             )
             patches.append({"index": gy * G + gx, "value": val})
     patches.sort(key=lambda p: p["value"], reverse=True)
+    positive = [p for p in patches if p["value"] > 0.0]
+    if not positive:
+        return [{"position": "none", "value": 0.0}]
     return [
         {"position": patch_position_to_text(p["index"], G), "value": p["value"]}
-        for p in patches[:top_k]
+        for p in positive[:top_k]
     ]
 
 
@@ -170,6 +201,8 @@ def explain_defect(
     memory_bank,
     class_name,
     pipe=None,
+    gradcam_gen=None,
+    shap_gen=None,
     grid_size=7,
     n_evals=200,
 ):
@@ -185,17 +218,19 @@ def explain_defect(
     # 1. Score via AdaptCLIP forward
     with torch.no_grad():
         score_tensor, _ = model(image, memory_tensor, class_name)
-    anomaly_score = float(score_tensor[0].sigmoid().item())
+    anomaly_score = float(score_tensor[0].item())
 
     # 2. GradCAM heatmap
-    gradcam_gen = CLIPGradCAM(model)
+    if gradcam_gen is None:
+        gradcam_gen = CLIPGradCAM(model)
     gradcam_map = gradcam_gen.generate(
         image, memory_bank, class_name, img_size=image.shape[-1]
     )
 
     # 3. SHAP attribution map
     image_np = _denormalize_image(image[0])
-    shap_gen = PatchSHAPExplainer(model, memory_bank, class_name, grid_size=grid_size)
+    if shap_gen is None:
+        shap_gen = PatchSHAPExplainer(model, memory_bank, class_name, grid_size=grid_size)
     shap_map = shap_gen.explain(image_np, n_evals=n_evals)
 
     # 4. Extract interpretable signals from maps
@@ -206,7 +241,7 @@ def explain_defect(
     prompt = build_explanation_prompt(
         class_name, anomaly_score, top_shap, gradcam_region
     )
-    explanation = get_explanation(prompt, pipe=pipe)
+    explanation, pipe = get_explanation(prompt, pipe=pipe)
 
     latency_ms = round((time.perf_counter() - start) * 1000)
 
@@ -216,6 +251,7 @@ def explain_defect(
         "shap_map": shap_map,
         "explanation": explanation,
         "latency_ms": latency_ms,
+        "pipe": pipe,
     }
 
 
@@ -250,6 +286,7 @@ def run_explanation_test(
     total_latency = 0.0
     total_images = 0
 
+    pipe = None
     for cat in categories:
         logger.info("Processing category: %s", cat)
         train_ds = MVTecDataset(data_dir, cat, split="train", transform=transform)
@@ -267,7 +304,9 @@ def run_explanation_test(
         )
         test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
 
-        pipe = None
+        gradcam_gen = CLIPGradCAM(adapt_model)
+        shap_gen = PatchSHAPExplainer(adapt_model, memory, cat, grid_size=grid_size)
+
         images_done = 0
         for image_tensor, mask_tensor, label in test_loader:
             if int(label.item()) != 1:
@@ -278,9 +317,10 @@ def run_explanation_test(
             image_tensor = image_tensor.to(device)
             result = explain_defect(
                 image_tensor, adapt_model, memory, cat,
-                pipe=pipe, grid_size=grid_size, n_evals=n_evals,
+                pipe=pipe, gradcam_gen=gradcam_gen, shap_gen=shap_gen,
+                grid_size=grid_size, n_evals=n_evals,
             )
-            pipe = None
+            pipe = result.pop("pipe")
 
             print(
                 f"[{cat} #{images_done + 1}] "
