@@ -17,23 +17,29 @@ Outputs:
 Usage:
   python generate_xai_gallery.py --data_dir /path/to/mvtec_anomaly_detection
 
-Fixes vs original
+Scoring mechanism
 -----------------
-1. Anomaly score: replaced random adapter output with direct memory-distance
-   scoring (_compute_memory_distance_score). The PromptQueryAdapter has
-   untrained random weights that saturate sigmoid near 1.0 for all inputs,
-   causing every image to be predicted anomalous (massive FP rate).
-   Direct L2 distance to the normal memory bank gives meaningful discrimination.
-2. _generate_score_map_overlay: now uses clip_model.encode_image + ln_post
-   hook to extract patch tokens directly, instead of calling the full
-   AdaptCLIPModel which includes the broken adapter.
-3. cm.get_cmap("jet") deprecated since matplotlib 3.7. Replaced with
+Matches full_evaluation.py few-shot mode exactly:
+  1. Patch-level cosine distance to memory bank features
+  2. Z-score calibration against normal training images (median + MAD)
+  3. Baseline subtraction (median of Z-scores)
+  4. Image score = 95th percentile of calibrated patch scores
+  5. Fixed threshold = 0.5 (FR-02 from project spec)
+
+The PromptQueryAdapter is NOT used for scoring (its weights are untrained random).
+Grad-CAM and SHAP use the same memory-distance objective internally, so their
+heatmaps are consistent with the anomaly score.
+
+Other fixes
+-----------
+1. cm.get_cmap("jet") deprecated since matplotlib 3.7. Replaced with
    matplotlib.colormaps["jet"].
-4. _select_test_images: O(n²) list comprehensions on every loop iteration
+2. _select_test_images: O(n²) list comprehensions on every loop iteration
    replaced with a simple anomalous_count integer counter.
-5. `import matplotlib.pyplot as mpl_plt` was inside the per-image processing
+3. `import matplotlib.pyplot as mpl_plt` was inside the per-image processing
    loop. Moved to module-level import at the top of the file.
-6. result["pipe"] popped to avoid holding LLM pipeline reference in result dict.
+4. result["pipe"] popped to avoid holding LLM pipeline reference in result dict.
+5. SHAP column: white grid lines drawn at 7x7 patch boundaries for visibility.
 """
 
 import argparse
@@ -90,68 +96,145 @@ def _denormalize_image(tensor):
     return (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
 
-def _compute_memory_distance_score(image_tensor, clip_model, memory_tensor):
-    """Compute anomaly score using direct memory distance (bypasses random adapters).
+def _extract_patch_features(clip_model, image_tensor):
+    """Extract global feature and patch tokens from CLIP visual encoder.
 
-    Returns a float in [0, 1] where higher = more anomalous.
-    Uses the same distance metric as CLIPGradCAM._memory_distance_score.
+    Matches _extract_features() in full_evaluation.py exactly.
+    Returns (global_feat, patch_tokens) where patch_tokens excludes CLS token.
     """
     if image_tensor.dim() == 3:
         image_tensor = image_tensor.unsqueeze(0)
 
+    target = getattr(clip_model.visual, "ln_post", None)
+    if target is None:
+        return None, None
+
+    patch_features = [None]
+
+    def hook(module, inp, out):
+        patch_features[0] = out.detach()
+
+    handle = target.register_forward_hook(hook)
     with torch.no_grad():
         global_feat = clip_model.encode_image(image_tensor)
+    handle.remove()
 
-    raw_distance = CLIPGradCAM._memory_distance_score(global_feat, memory_tensor).item()
+    patch_feats = patch_features[0]
+    if patch_feats is None:
+        return global_feat, None
 
-    # Raw squared-L2 distances for normalized CLIP features:
-    #   normal images: ~0.05-0.3  (close to memory bank)
-    #   anomalous:     ~0.3-2.0+  (far from memory bank)
-    # Sigmoid with scale=3.0 gives good separation in [0,1]
-    anomaly_score = float(torch.sigmoid(torch.tensor(raw_distance * 3.0)).item())
-    return anomaly_score
+    # Standardize layout: ensure [B, tokens, C]
+    if patch_feats.dim() == 3 and patch_feats.shape[0] > patch_feats.shape[1] and patch_feats.shape[0] > 32:
+        patch_feats = patch_feats.permute(1, 0, 2)
+
+    # Project to match global feature dimension if needed
+    if patch_feats.shape[-1] != global_feat.shape[-1]:
+        proj = getattr(clip_model.visual, "proj", None)
+        if proj is not None and patch_feats.shape[-1] == proj.shape[0]:
+            patch_feats = patch_feats @ proj.detach().to(patch_feats.device)
+
+    # Drop CLS token
+    return global_feat, patch_feats[0, 1:, :]
 
 
-def _generate_score_map_overlay(image_tensor, clip_model, memory_tensor, img_size=IMG_SIZE):
+def _build_patch_calibration(clip_model, train_loader, n_shots, patch_memory_tensor, device):
+    """Build Z-score calibration stats from normal training images.
+
+    Matches _build_patch_calibration() in full_evaluation.py exactly.
+    Returns (center, scale) arrays for per-patch Z-score calibration.
+    """
+    scores = []
+    count = 0
+    for images, _ in train_loader:
+        if count >= n_shots:
+            break
+        image = images.to(device)
+        _, query_patches = _extract_patch_features(clip_model, image)
+        if query_patches is None:
+            continue
+        patch_scores = compute_patch_scores(
+            query_patches,
+            patch_memory_tensor.to(query_patches.device),
+            metric="cosine",
+            top_k=3,
+        )
+        scores.append(patch_scores.detach().cpu().numpy())
+        count += images.size(0)
+
+    if not scores:
+        raise RuntimeError("No normal calibration scores collected")
+
+    normal_matrix = np.stack(scores).astype(np.float32)
+    center = np.median(normal_matrix, axis=0)
+    mad = np.median(np.abs(normal_matrix - center), axis=0)
+    scale = 1.4826 * mad
+    positive_scale = scale[scale > 0]
+    scale_floor = np.percentile(positive_scale, 10) if positive_scale.size else 1e-6
+    scale = np.maximum(scale, max(float(scale_floor), 1e-6))
+    return center, scale
+
+
+def _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, normal_scale, baseline_quantile=0.5):
+    """Calibrate patch scores and return image-level anomaly score.
+
+    Matches the few-shot scoring in full_evaluation.py exactly:
+    1. Compute raw cosine distances to memory bank
+    2. Z-score calibrate against normal stats
+    3. Subtract baseline (median of Z-scores)
+    4. Image score = 95th percentile of calibrated patch scores
+    """
+    raw_scores = compute_patch_scores(
+        query_patches,
+        patch_memory_tensor.to(query_patches.device),
+        metric="cosine",
+        top_k=3,
+    )
+
+    center = torch.as_tensor(normal_center, device=query_patches.device, dtype=query_patches.dtype)
+    scale = torch.as_tensor(normal_scale, device=query_patches.device, dtype=query_patches.dtype)
+    z = torch.clamp((raw_scores - center) / scale, min=0.0)
+    baseline = torch.quantile(z, baseline_quantile)
+    calibrated = torch.clamp(z - baseline, min=0.0)
+
+    # Image-level score: 95th percentile of calibrated patch scores
+    score = float(torch.quantile(calibrated, 0.95).detach().cpu())
+    return score
+
+
+def _compute_anomaly_score(
+    image_tensor, clip_model, patch_memory_tensor, normal_center, normal_scale, device
+):
+    """Full scoring pipeline matching full_evaluation.py few-shot mode.
+
+    Returns a float anomaly score where higher = more anomalous.
+    Uses calibrated patch-level cosine distances with 95th percentile aggregation.
+    """
+    if image_tensor.dim() == 3:
+        image_tensor = image_tensor.unsqueeze(0)
+    image_tensor = image_tensor.to(device)
+
+    _, query_patches = _extract_patch_features(clip_model, image_tensor)
+    if query_patches is None:
+        return 0.0
+
+    return _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, normal_scale)
+
+
+def _generate_score_map_overlay(image_tensor, clip_model, patch_memory_tensor, img_size=IMG_SIZE):
     """Generate a score-map heatmap overlay from patch-level anomaly scores.
 
     Uses direct cosine-similarity distance on patch features (no adapter).
     """
-    if image_tensor.dim() == 3:
-        image_tensor = image_tensor.unsqueeze(0)
-
-    with torch.no_grad():
-        _, patch_feats = clip_model.encode_image(image_tensor), None
-        # Get patch tokens via a forward hook on ln_post
-        _patch_tokens = [None]
-
-        def hook(module, inp, out):
-            _patch_tokens[0] = out.detach()
-
-        target = getattr(clip_model.visual, "ln_post", None)
-        if target is None:
-            return None
-        handle = target.register_forward_hook(hook)
-        try:
-            clip_model.encode_image(image_tensor)
-        finally:
-            handle.remove()
-
-    patch_feats = _patch_tokens[0]
-    if patch_feats is None:
+    _, query_patches = _extract_patch_features(clip_model, image_tensor)
+    if query_patches is None:
         return None
 
-    patch_tokens = patch_feats[0, 1:]  # drop CLS token
-    if patch_tokens.numel() == 0:
-        return None
-
-    # Project patch tokens to match memory bank dimension if needed
-    if patch_tokens.shape[-1] != memory_tensor.shape[-1]:
+    if query_patches.shape[-1] != patch_memory_tensor.shape[-1]:
         proj = getattr(clip_model.visual, "proj", None)
         if proj is not None:
-            patch_tokens = patch_tokens @ proj.detach().to(patch_tokens.device)
+            query_patches = query_patches @ proj.detach().to(query_patches.device)
 
-    scores = compute_patch_scores(patch_tokens, memory_tensor, metric="cosine", top_k=3)
+    scores = compute_patch_scores(query_patches, patch_memory_tensor, metric="cosine", top_k=3)
     heatmap = scores_to_heatmap(scores, img_size=img_size, patch_size=14, sigma=4.0)
     original_np = _denormalize_image(image_tensor[0])
     overlay = overlay_heatmap(original_np, heatmap.cpu().numpy(), alpha=0.5)
@@ -173,8 +256,7 @@ def _normalize_map_for_display(map_2d):
 # ---------------------------------------------------------------------------
 
 def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation,
-                  anomaly_score, true_label, predicted_label, defect_type="",
-                  threshold=0.5):
+                  anomaly_score, true_label, predicted_label, defect_type=""):
     """Render a single panel as a matplotlib figure: 1x4 grid + text."""
     fig, axes = mpl_plt.subplots(1, 4, figsize=(16, 4))
 
@@ -191,7 +273,6 @@ def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation
     axes[1].set_title("Score Map", fontsize=10)
     axes[1].axis("off")
 
-    # FIX 5: cm.get_cmap("jet") deprecated since matplotlib 3.7 → use colormaps[]
     jet = matplotlib.colormaps["jet"]
 
     # Grad-CAM Overlay
@@ -203,7 +284,7 @@ def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation
     axes[2].set_title("Grad-CAM", fontsize=10)
     axes[2].axis("off")
 
-    # SHAP Overlay
+    # SHAP Overlay with visible 7x7 grid lines
     shap_display = _normalize_map_for_display(shap_map)
     shap_colored = jet(shap_display)[:, :, :3]
     shap_overlay = (0.5 * original_np.astype(np.float32) / 255.0 + 0.5 * shap_colored)
@@ -212,11 +293,29 @@ def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation
     axes[3].set_title("SHAP (7x7 fast)", fontsize=10)
     axes[3].axis("off")
 
+    # Draw white grid lines at patch boundaries (7x7 grid on 224x224 = 32px per patch)
+    h, w = original_np.shape[:2]
+    patch_h, patch_w = h / 7, w / 7
+    for i in range(1, 7):
+        y = int(i * patch_h)
+        x = int(i * patch_w)
+        axes[3].axhline(y, color="white", linewidth=0.8, alpha=0.7)
+        axes[3].axvline(x, color="white", linewidth=0.8, alpha=0.7)
+
     # Explanation text below
     status = (
-        "TP" if (true_label == 1 and anomaly_score >= threshold) else
-        "TN" if (true_label == 0 and anomaly_score < threshold) else
-        "FN" if (true_label == 1 and anomaly_score < threshold) else "FP"
+        "TP" if (true_label == 1 and anomaly_score >= ANOMALY_THRESHOLD) else
+        "TN" if (true_label == 0 and anomaly_score < ANOMALY_THRESHOLD) else
+        "FN" if (true_label == 1 and anomaly_score < ANOMALY_THRESHOLD) else "FP"
+    )
+
+    text_str = (
+        f"Category: {defect_type or 'N/A'}  |  "
+        f"Anomaly Score: {anomaly_score:.4f}  |  "
+        f"True: {'Anomalous' if true_label == 1 else 'Normal'}  |  "
+        f"Predicted: {'Anomalous' if predicted_label == 1 else 'Normal'}  |  "
+        f"Status: {status}\n"
+        f"Explanation: {explanation}"
     )
 
     text_str = (
@@ -491,7 +590,6 @@ def generate_gallery(
     all_panels = []
     tp, fp, tn, fn = 0, 0, 0, 0
     pipe = None
-    category_thresholds = {}
 
     for cat_idx, cat in enumerate(CATEGORIES):
         logger.info("=" * 60)
@@ -504,33 +602,20 @@ def generate_gallery(
         train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
         memory = MemoryBank(feat_dim=768, mode="global")
         memory.build(clip_model, train_loader, n_shots, device)
-        memory_tensor = torch.from_numpy(memory.index.reconstruct_n(0, memory.index.ntotal)).to(device)
         patch_memory_tensor = memory.get_patch_bank().to(device)
         logger.info("Memory bank: %d vectors for %s", memory.size, cat)
+
+        # Build Z-score calibration from normal training images (matches full_evaluation.py)
+        normal_center, normal_scale = _build_patch_calibration(
+            clip_model, train_loader, n_shots, patch_memory_tensor, device
+        )
+        logger.info("Patch calibration built for %s (center shape=%s)", cat, normal_center.shape)
 
         # Load test set
         test_ds = MVTecDataset(
             data_dir, cat, split="test",
             transform=transform, mask_transform=mask_transform,
         )
-
-        # Calibrate threshold: score all normal test images, use 95th percentile
-        normal_scores = []
-        for idx in range(len(test_ds)):
-            img_t, _, lbl = test_ds[idx]
-            if int(lbl.item()) == 0:
-                normal_scores.append(
-                    _compute_memory_distance_score(img_t, clip_model, memory_tensor)
-                )
-        if normal_scores:
-            cat_threshold = float(np.percentile(normal_scores, 95))
-            # Clamp to reasonable range
-            cat_threshold = max(0.05, min(0.95, cat_threshold))
-        else:
-            cat_threshold = ANOMALY_THRESHOLD
-        category_thresholds[cat] = cat_threshold
-        logger.info("Calibrated threshold for %s: %.4f (from %d normal images)",
-                     cat, cat_threshold, len(normal_scores))
 
         # Select images
         selected = _select_test_images(test_ds, cat, max_anomalous, max_normal)
@@ -568,15 +653,17 @@ def generate_gallery(
                 shap_map = result["shap_map"]
                 explanation = result["explanation"]
 
-                # FIX: bypass random adapter score; use direct memory distance
-                anomaly_score = _compute_memory_distance_score(
-                    image_tensor, clip_model, memory_tensor
+                # Scoring: calibrated patch-level cosine distance (matches full_evaluation.py few-shot)
+                anomaly_score = _compute_anomaly_score(
+                    image_tensor, clip_model, patch_memory_tensor,
+                    normal_center, normal_scale, device,
                 )
             except Exception as e:
                 logger.error("Failed on %s idx %d: %s", cat, ds_idx, e)
                 continue
 
-            predicted_label = 1 if anomaly_score >= cat_threshold else 0
+            # FR-02: fixed 0.5 threshold from project spec
+            predicted_label = 1 if anomaly_score >= ANOMALY_THRESHOLD else 0
 
             # Update confusion counts
             if true_label == 1 and predicted_label == 1:
@@ -600,14 +687,14 @@ def generate_gallery(
             fig = _render_panel(
                 original_np, score_overlay, gradcam_map, shap_map,
                 explanation, anomaly_score, true_label, predicted_label,
-                defect_type=defect_type, threshold=cat_threshold,
+                defect_type=defect_type,
             )
 
             # Save panel as individual PNG (for HTML embedding)
             panel_filename = f"{cat}_{sel_idx:02d}_{defect_type}.png"
             panel_path = os.path.join(output_heatmap_dir, panel_filename)
             fig.savefig(panel_path, dpi=120, bbox_inches="tight", facecolor="white")
-            mpl_plt.close(fig)   # FIX 7: mpl_plt is now the module-level import
+            mpl_plt.close(fig)
 
             category_panels.append({
                 "category": cat,
@@ -617,7 +704,6 @@ def generate_gallery(
                 "predicted_label": predicted_label,
                 "explanation": explanation,
                 "img_path": panel_path,
-                "threshold": cat_threshold,
             })
 
             print(
@@ -648,15 +734,8 @@ def generate_gallery(
     # Print confusion summary
     total = tp + fp + tn + fn
     print("\n" + "=" * 60)
-    print("CONFUSION SUMMARY (per-category calibrated thresholds)")
+    print("CONFUSION SUMMARY (threshold = {:.1f}, FR-02 spec)".format(ANOMALY_THRESHOLD))
     print("=" * 60)
-    print(f"  {'Category':<14} {'Threshold':>10}")
-    print(f"  {'-'*14} {'-'*10}")
-    for cat in CATEGORIES:
-        if cat in category_thresholds:
-            print(f"  {cat:<14} {category_thresholds[cat]:>10.4f}")
-    print(f"  {'-'*14} {'-'*10}")
-    print()
     print(f"  True Positives  (TP): {tp}")
     print(f"  False Positives (FP): {fp}")
     print(f"  True Negatives  (TN): {tn}")
