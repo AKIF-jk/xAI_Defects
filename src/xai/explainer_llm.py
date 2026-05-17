@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import pickle
 import sys
 import time
 
@@ -19,6 +20,45 @@ from model.backbone import load_backbone
 from model.memory_bank import MemoryBank
 from xai.gradcam import CLIPGradCAM
 from xai.shap_explainer import PatchSHAPExplainer
+
+
+def _ckpt_path(output_dir):
+    return os.path.join(output_dir, "explainer_checkpoint.pkl")
+
+
+def _save_ckpt(output_dir, explanations, total_latency, total_images, processed_pairs):
+    path = _ckpt_path(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    data = dict(
+        explanations=[{k: v for k, v in e.items() if k not in ("gradcam_map", "shap_map")}
+                      for e in explanations],
+        explanations_full=explanations,
+        total_latency=total_latency,
+        total_images=total_images,
+        processed_pairs=list(processed_pairs),
+    )
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
+    logger.info("Checkpoint saved to %s (%d images)", path, total_images)
+
+
+def _load_ckpt(output_dir):
+    path = _ckpt_path(output_dir)
+    if not os.path.exists(path):
+        logger.info("No checkpoint found at %s", path)
+        return [], 0.0, 0, set()
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    logger.info(
+        "Loaded checkpoint from %s (%d images done, %d pairs processed)",
+        path, data["total_images"], len(data["processed_pairs"]),
+    )
+    return (
+        data.get("explanations_full", data["explanations"]),
+        data["total_latency"],
+        data["total_images"],
+        set(data["processed_pairs"]),
+    )
 
 
 def patch_position_to_text(patch_idx, grid_size, img_size=None):
@@ -91,13 +131,13 @@ def get_explanation(
     temperature=0.3,
 ):
     if pipe is None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline as hf_pipeline
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline as hf_pipeline
 
         tokenizer = AutoTokenizer.from_pretrained(model)
-        torch_dtype = torch.float16 if device != "cpu" else torch.float32
+        quantization_config = BitsAndBytesConfig(load_in_4bit=True) if device != "cpu" else None
         hf_model = AutoModelForCausalLM.from_pretrained(
             model,
-            torch_dtype=torch_dtype,
+            quantization_config=quantization_config,
             device_map="auto" if device != "cpu" else None,
         )
         pipe = hf_pipeline(
@@ -276,6 +316,7 @@ def run_explanation_test(
     n_evals=200,
     categories=("metal_nut", "leather", "cable"),
     max_anomalous=5,
+    resume=False,
 ):
     clip_model, _, _, device = load_backbone(device)
     adapt_model = AdaptCLIPModel(clip_model, device).to(device)
@@ -294,9 +335,10 @@ def run_explanation_test(
         transforms.ToTensor(),
     ])
 
-    all_explanations = []
-    total_latency = 0.0
-    total_images = 0
+    if resume:
+        all_explanations, total_latency, total_images, processed_pairs = _load_ckpt(output_dir)
+    else:
+        all_explanations, total_latency, total_images, processed_pairs = [], 0.0, 0, set()
 
     pipe = None
     for cat_idx, cat in enumerate(categories):
@@ -332,6 +374,12 @@ def run_explanation_test(
                 logger.info("Reached max %d anomalous images for %s", max_anomalous, cat)
                 break
 
+            pair = (cat, img_idx)
+            if pair in processed_pairs:
+                logger.info("Skipping already-processed %s image idx %d", cat, img_idx)
+                images_done += 1
+                continue
+
             logger.info(
                 "Processing anomalous image %d/%d for %s (dataset idx %d)...",
                 images_done + 1, max_anomalous, cat, img_idx,
@@ -361,6 +409,8 @@ def run_explanation_test(
             total_latency += result["latency_ms"]
             total_images += 1
             images_done += 1
+            processed_pairs.add(pair)
+            _save_ckpt(output_dir, all_explanations, total_latency, total_images, processed_pairs)
 
         cat_elapsed = time.perf_counter() - cat_start
         logger.info("Category %s complete in %.1fs", cat, cat_elapsed)
@@ -391,6 +441,7 @@ def main():
         default=["metal_nut", "leather", "cable"],
     )
     parser.add_argument("--max_anomalous", type=int, default=5)
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     args = parser.parse_args()
 
     run_explanation_test(
@@ -402,6 +453,7 @@ def main():
         n_evals=args.n_evals,
         categories=tuple(args.categories),
         max_anomalous=args.max_anomalous,
+        resume=args.resume,
     )
 
 
