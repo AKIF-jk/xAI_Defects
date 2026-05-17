@@ -710,13 +710,13 @@ def main():
     parser.add_argument("--output_heatmap_dir", default="./outputs/heatmaps")
     parser.add_argument("--output_results_dir", default="./outputs/results")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--n_shots", type=int, default=4, help="Normal shots for memory bank")
-    parser.add_argument("--grid_size", type=int, default=7, help="SHAP patch grid (7x7 fast mode)")
-    parser.add_argument("--n_evals", type=int, default=50, help="SHAP evaluations per image")
+    parser.add_argument("--n_shots", type=int, default=32, help="Normal shots for memory bank")
+    parser.add_argument("--grid_size", type=int, default=13, help="SHAP patch grid (7x7 fast mode)")
+    parser.add_argument("--n_evals", type=int, default=200, help="SHAP evaluations per image")
     parser.add_argument("--llm_model", default="Qwen/Qwen2.5-0.5B-Instruct",
                         help="HuggingFace LLM for explanations")
     parser.add_argument("--use_4bit", action="store_true", help="4-bit LLM quantization")
-    parser.add_argument("--max_anomalous", type=int, default=4,
+    parser.add_argument("--max_anomalous", type=int, default=5,
                         help="Max anomalous images per category")
     parser.add_argument("--max_normal", type=int, default=1,
                         help="Max normal images per category")
