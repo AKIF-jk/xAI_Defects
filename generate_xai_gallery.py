@@ -419,12 +419,12 @@ def generate_gallery(
     output_heatmap_dir="./outputs/heatmaps",
     output_results_dir="./outputs/results",
     device=None,
-    n_shots=4,
-    grid_size=7,
-    n_evals=50,
+    n_shots=32,
+    grid_size=13,
+    n_evals=200,
     llm_model="Qwen/Qwen2.5-0.5B-Instruct",
     use_4bit=False,
-    max_anomalous=4,
+    max_anomalous=5,
     max_normal=1,
 ):
     """Generate the full XAI gallery across all 15 MVTec AD categories."""
