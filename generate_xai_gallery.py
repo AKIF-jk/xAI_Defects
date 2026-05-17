@@ -317,16 +317,6 @@ def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation
         f"Status: {status}\n"
         f"Explanation: {explanation}"
     )
-
-    text_str = (
-        f"Category: {defect_type or 'N/A'}  |  "
-        f"Anomaly Score: {anomaly_score:.4f}  |  "
-        f"Threshold: {threshold:.4f}  |  "
-        f"True: {'Anomalous' if true_label == 1 else 'Normal'}  |  "
-        f"Predicted: {'Anomalous' if predicted_label == 1 else 'Normal'}  |  "
-        f"Status: {status}\n"
-        f"Explanation: {explanation}"
-    )
     fig.text(0.5, 0.01, text_str, ha="center", va="bottom", fontsize=9,
              fontfamily="monospace",
              bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
