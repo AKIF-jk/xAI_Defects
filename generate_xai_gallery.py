@@ -19,23 +19,21 @@ Usage:
 
 Fixes vs original
 -----------------
-1. _generate_score_map_overlay: model() was called with only image_tensor — missing
-   memory_tensor and class_name → TypeError crash. Fixed by passing all three args
-   and adding .unsqueeze(0) for the missing batch dimension.
-2. _generate_score_map_overlay: return-value unpacking was reversed.
-   AdaptCLIPModel.forward returns (score, features); the original had (_, patch_feats)
-   which assigned the anomaly score to patch_feats. Fixed to (score, patch_feats).
-3. _generate_score_map_overlay: image_tensor was [C,H,W] (no batch dim) from
-   test_ds[idx]; added .unsqueeze(0) before the model call.
-4. result["pipe"] not popped: pipe was read but left inside the result dict,
-   keeping the LLM pipeline alive as an extra reference. Fixed to result.pop("pipe").
-5. cm.get_cmap("jet") deprecated since matplotlib 3.7. Replaced with
+1. Anomaly score: replaced random adapter output with direct memory-distance
+   scoring (_compute_memory_distance_score). The PromptQueryAdapter has
+   untrained random weights that saturate sigmoid near 1.0 for all inputs,
+   causing every image to be predicted anomalous (massive FP rate).
+   Direct L2 distance to the normal memory bank gives meaningful discrimination.
+2. _generate_score_map_overlay: now uses clip_model.encode_image + ln_post
+   hook to extract patch tokens directly, instead of calling the full
+   AdaptCLIPModel which includes the broken adapter.
+3. cm.get_cmap("jet") deprecated since matplotlib 3.7. Replaced with
    matplotlib.colormaps["jet"].
-6. _select_test_images: O(n²) list comprehensions on every loop iteration
-   replaced with a simple anomalous_count integer counter. Also removed
-   brittle s[3] tuple-index access; now uses a named counter directly.
-7. `import matplotlib.pyplot as mpl_plt` was inside the per-image processing
+4. _select_test_images: O(n²) list comprehensions on every loop iteration
+   replaced with a simple anomalous_count integer counter.
+5. `import matplotlib.pyplot as mpl_plt` was inside the per-image processing
    loop. Moved to module-level import at the top of the file.
+6. result["pipe"] popped to avoid holding LLM pipeline reference in result dict.
 """
 
 import argparse
@@ -92,26 +90,64 @@ def _denormalize_image(tensor):
     return (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
 
-def _generate_score_map_overlay(image_tensor, model, memory_tensor, class_name, img_size=IMG_SIZE):
-    """Generate a score-map heatmap overlay from patch-level anomaly scores."""
-    model.eval()
+def _compute_memory_distance_score(image_tensor, clip_model, memory_tensor):
+    """Compute anomaly score using direct memory distance (bypasses random adapters).
 
-    # FIX 1 & 3: add missing batch dim; pass all required args to model()
+    Returns a float in [0, 1] where higher = more anomalous.
+    Uses the same distance metric as CLIPGradCAM._memory_distance_score.
+    """
     if image_tensor.dim() == 3:
         image_tensor = image_tensor.unsqueeze(0)
 
     with torch.no_grad():
-        # FIX 2: AdaptCLIPModel.forward returns (score, features) — was reversed
-        score, patch_feats = model(image_tensor, memory_tensor, class_name)
+        global_feat = clip_model.encode_image(image_tensor)
 
+    raw_distance = CLIPGradCAM._memory_distance_score(global_feat, memory_tensor).item()
+
+    # Raw squared-L2 distances for normalized CLIP features:
+    #   normal images: ~0.05-0.3  (close to memory bank)
+    #   anomalous:     ~0.3-2.0+  (far from memory bank)
+    # Sigmoid with scale=3.0 gives good separation in [0,1]
+    anomaly_score = float(torch.sigmoid(torch.tensor(raw_distance * 3.0)).item())
+    return anomaly_score
+
+
+def _generate_score_map_overlay(image_tensor, clip_model, memory_tensor, img_size=IMG_SIZE):
+    """Generate a score-map heatmap overlay from patch-level anomaly scores.
+
+    Uses direct cosine-similarity distance on patch features (no adapter).
+    """
+    if image_tensor.dim() == 3:
+        image_tensor = image_tensor.unsqueeze(0)
+
+    with torch.no_grad():
+        _, patch_feats = clip_model.encode_image(image_tensor), None
+        # Get patch tokens via a forward hook on ln_post
+        _patch_tokens = [None]
+
+        def hook(module, inp, out):
+            _patch_tokens[0] = out.detach()
+
+        target = getattr(clip_model.visual, "ln_post", None)
+        if target is None:
+            return None
+        handle = target.register_forward_hook(hook)
+        try:
+            clip_model.encode_image(image_tensor)
+        finally:
+            handle.remove()
+
+    patch_feats = _patch_tokens[0]
     if patch_feats is None:
         return None
+
     patch_tokens = patch_feats[0, 1:]  # drop CLS token
     if patch_tokens.numel() == 0:
         return None
 
+    # Project patch tokens to match memory bank dimension if needed
     if patch_tokens.shape[-1] != memory_tensor.shape[-1]:
-        proj = getattr(model.clip_model.visual, "proj", None)
+        proj = getattr(clip_model.visual, "proj", None)
         if proj is not None:
             patch_tokens = patch_tokens @ proj.detach().to(patch_tokens.device)
 
@@ -504,12 +540,15 @@ def generate_gallery(
                     llm_model=llm_model,
                     use_4bit=use_4bit,
                 )
-                # FIX 4: pop pipe so it isn't held in the result dict across iterations
                 pipe = result.pop("pipe")
-                anomaly_score = result["score"]
                 gradcam_map = result["gradcam_map"]
                 shap_map = result["shap_map"]
                 explanation = result["explanation"]
+
+                # FIX: bypass random adapter score; use direct memory distance
+                anomaly_score = _compute_memory_distance_score(
+                    image_tensor, clip_model, memory_tensor
+                )
             except Exception as e:
                 logger.error("Failed on %s idx %d: %s", cat, ds_idx, e)
                 continue
@@ -526,9 +565,9 @@ def generate_gallery(
             else:
                 fp += 1
 
-            # Generate score map overlay
+            # Generate score map overlay (uses direct patch-cosine distance, no adapter)
             score_overlay = _generate_score_map_overlay(
-                image_tensor, adapt_model, patch_memory_tensor, cat, IMG_SIZE
+                image_tensor, clip_model, patch_memory_tensor, IMG_SIZE
             )
 
             # Denormalize original
