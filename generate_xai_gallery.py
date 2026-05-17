@@ -173,7 +173,8 @@ def _normalize_map_for_display(map_2d):
 # ---------------------------------------------------------------------------
 
 def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation,
-                  anomaly_score, true_label, predicted_label, defect_type=""):
+                  anomaly_score, true_label, predicted_label, defect_type="",
+                  threshold=0.5):
     """Render a single panel as a matplotlib figure: 1x4 grid + text."""
     fig, axes = mpl_plt.subplots(1, 4, figsize=(16, 4))
 
@@ -213,14 +214,15 @@ def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation
 
     # Explanation text below
     status = (
-        "TP" if (true_label == 1 and anomaly_score >= ANOMALY_THRESHOLD) else
-        "TN" if (true_label == 0 and anomaly_score < ANOMALY_THRESHOLD) else
-        "FN" if (true_label == 1 and anomaly_score < ANOMALY_THRESHOLD) else "FP"
+        "TP" if (true_label == 1 and anomaly_score >= threshold) else
+        "TN" if (true_label == 0 and anomaly_score < threshold) else
+        "FN" if (true_label == 1 and anomaly_score < threshold) else "FP"
     )
 
     text_str = (
         f"Category: {defect_type or 'N/A'}  |  "
         f"Anomaly Score: {anomaly_score:.4f}  |  "
+        f"Threshold: {threshold:.4f}  |  "
         f"True: {'Anomalous' if true_label == 1 else 'Normal'}  |  "
         f"Predicted: {'Anomalous' if predicted_label == 1 else 'Normal'}  |  "
         f"Status: {status}\n"
@@ -298,13 +300,14 @@ def _generate_html(all_panels, html_path, heatmap_dir):
         defect_type = panel["defect_type"]
         img_path = panel["img_path"]
 
-        if true_label == 1 and score >= ANOMALY_THRESHOLD:
+        # Status is already determined by predicted_label (computed with per-cat threshold)
+        if true_label == 1 and predicted_label == 1:
             status = "TP"
             row_color = "#e6ffe6"
-        elif true_label == 0 and score < ANOMALY_THRESHOLD:
+        elif true_label == 0 and predicted_label == 0:
             status = "TN"
             row_color = "#e6f0ff"
-        elif true_label == 1 and score < ANOMALY_THRESHOLD:
+        elif true_label == 1 and predicted_label == 0:
             status = "FN"
             row_color = "#ffe6e6"
         else:
@@ -488,6 +491,7 @@ def generate_gallery(
     all_panels = []
     tp, fp, tn, fn = 0, 0, 0, 0
     pipe = None
+    category_thresholds = {}
 
     for cat_idx, cat in enumerate(CATEGORIES):
         logger.info("=" * 60)
@@ -509,6 +513,24 @@ def generate_gallery(
             data_dir, cat, split="test",
             transform=transform, mask_transform=mask_transform,
         )
+
+        # Calibrate threshold: score all normal test images, use 95th percentile
+        normal_scores = []
+        for idx in range(len(test_ds)):
+            img_t, _, lbl = test_ds[idx]
+            if int(lbl.item()) == 0:
+                normal_scores.append(
+                    _compute_memory_distance_score(img_t, clip_model, memory_tensor)
+                )
+        if normal_scores:
+            cat_threshold = float(np.percentile(normal_scores, 95))
+            # Clamp to reasonable range
+            cat_threshold = max(0.05, min(0.95, cat_threshold))
+        else:
+            cat_threshold = ANOMALY_THRESHOLD
+        category_thresholds[cat] = cat_threshold
+        logger.info("Calibrated threshold for %s: %.4f (from %d normal images)",
+                     cat, cat_threshold, len(normal_scores))
 
         # Select images
         selected = _select_test_images(test_ds, cat, max_anomalous, max_normal)
@@ -554,7 +576,7 @@ def generate_gallery(
                 logger.error("Failed on %s idx %d: %s", cat, ds_idx, e)
                 continue
 
-            predicted_label = 1 if anomaly_score >= ANOMALY_THRESHOLD else 0
+            predicted_label = 1 if anomaly_score >= cat_threshold else 0
 
             # Update confusion counts
             if true_label == 1 and predicted_label == 1:
@@ -578,7 +600,7 @@ def generate_gallery(
             fig = _render_panel(
                 original_np, score_overlay, gradcam_map, shap_map,
                 explanation, anomaly_score, true_label, predicted_label,
-                defect_type=defect_type,
+                defect_type=defect_type, threshold=cat_threshold,
             )
 
             # Save panel as individual PNG (for HTML embedding)
@@ -595,6 +617,7 @@ def generate_gallery(
                 "predicted_label": predicted_label,
                 "explanation": explanation,
                 "img_path": panel_path,
+                "threshold": cat_threshold,
             })
 
             print(
@@ -625,8 +648,15 @@ def generate_gallery(
     # Print confusion summary
     total = tp + fp + tn + fn
     print("\n" + "=" * 60)
-    print("CONFUSION SUMMARY (threshold = {:.1f})".format(ANOMALY_THRESHOLD))
+    print("CONFUSION SUMMARY (per-category calibrated thresholds)")
     print("=" * 60)
+    print(f"  {'Category':<14} {'Threshold':>10}")
+    print(f"  {'-'*14} {'-'*10}")
+    for cat in CATEGORIES:
+        if cat in category_thresholds:
+            print(f"  {cat:<14} {category_thresholds[cat]:>10.4f}")
+    print(f"  {'-'*14} {'-'*10}")
+    print()
     print(f"  True Positives  (TP): {tp}")
     print(f"  False Positives (FP): {fp}")
     print(f"  True Negatives  (TN): {tn}")
