@@ -500,6 +500,7 @@ def generate_gallery(
         train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
         memory = MemoryBank(feat_dim=768, mode="global")
         memory.build(clip_model, train_loader, n_shots, device)
+        memory_tensor = torch.from_numpy(memory.index.reconstruct_n(0, memory.index.ntotal)).to(device)
         patch_memory_tensor = memory.get_patch_bank().to(device)
         logger.info("Memory bank: %d vectors for %s", memory.size, cat)
 
