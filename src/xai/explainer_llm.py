@@ -338,6 +338,8 @@ def explain_defect(
     n_evals=50,
     llm_model="google/flan-t5-base",
     use_4bit=False,
+    score_override=None,
+    gradcam_score_mode="global",
 ):
     """
     Run GradCAM + SHAP + LLM for one image.
@@ -359,10 +361,14 @@ def explain_defect(
     memory_tensor = _as_memory_tensor(memory_bank, device)
 
     # 1. Anomaly score
-    logger.info("Computing anomaly score...")
-    with torch.no_grad():
-        score_tensor, _ = model(image, memory_tensor, class_name)
-    anomaly_score = float(score_tensor[0].item())
+    if score_override is None:
+        logger.info("Computing anomaly score...")
+        with torch.no_grad():
+            score_tensor, _ = model(image, memory_tensor, class_name)
+        anomaly_score = float(score_tensor[0].item())
+    else:
+        anomaly_score = float(score_override)
+        logger.info("Using supplied anomaly score: %.4f", anomaly_score)
     logger.info("Anomaly score: %.4f", anomaly_score)
 
     # 2. GradCAM
@@ -370,7 +376,13 @@ def explain_defect(
     t0 = time.perf_counter()
     if gradcam_gen is None:
         gradcam_gen = CLIPGradCAM(model)
-    gradcam_map = gradcam_gen.generate(image, memory_bank, class_name, img_size=image.shape[-1])
+    gradcam_map = gradcam_gen.generate(
+        image,
+        memory_bank,
+        class_name,
+        img_size=image.shape[-1],
+        score_mode=gradcam_score_mode,
+    )
     logger.info("GradCAM done in %.2fs", time.perf_counter() - t0)
 
     # 3. Offload LLM → run SHAP → restore LLM

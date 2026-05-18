@@ -1,15 +1,9 @@
 """
-shap_explainer.py  —  Colab free-tier optimised version
-========================================================
-Key changes vs original
------------------------
-1. SHAP masker: "inpaint_telea" (slow, high RAM) → "blur(11,11)" (fast, low RAM)
-   - inpaint_telea allocates large intermediate buffers for every masked sample
-   - blur masker replaces occluded patches with a blurred version — same quality signal,
-     fraction of the RAM and ~3× faster per evaluation
-2. Default n_evals: 200 → 50  (configurable; 50 gives good attribution maps on T4)
-3. gc.collect() + torch.cuda.empty_cache() at the end of explain()
-4. All other logic (grid, _predict, visualisation) is unchanged
+Patch-grid SHAP-style explainer for MVTec gallery outputs.
+
+The configured grid is the actual feature space: each cell is masked with a
+blurred baseline and added back in random permutation order. Patch contributions
+are the average marginal score deltas across complete grid permutations.
 """
 
 import argparse
@@ -24,8 +18,7 @@ logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -35,6 +28,7 @@ from data.mvtec_dataset import MVTecDataset
 from model.adaptclip import AdaptCLIPModel
 from model.backbone import load_backbone
 from model.memory_bank import MemoryBank
+from model.score_map import compute_patch_scores
 
 
 class PatchSHAPExplainer:
@@ -42,6 +36,7 @@ class PatchSHAPExplainer:
         self.model = model
         self.clip_model = model.clip_model if hasattr(model, "clip_model") else model
         self.memory_bank = self._as_memory_tensor(memory_bank, self._device)
+        self.patch_memory_bank = self._as_patch_memory_tensor(memory_bank, self._device)
         self.class_name = class_name
         self.grid_size = int(grid_size)
         if self.grid_size <= 0:
@@ -57,65 +52,38 @@ class PatchSHAPExplainer:
         except StopIteration:
             return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def _create_segment_map(self, height, width):
-        segment_map = np.zeros((height, width), dtype=np.int32)
-        y_edges = np.linspace(0, height, self.grid_size + 1, dtype=int)
-        x_edges = np.linspace(0, width, self.grid_size + 1, dtype=int)
-        for gy in range(self.grid_size):
-            for gx in range(self.grid_size):
-                y0, y1 = y_edges[gy], y_edges[gy + 1]
-                x0, x1 = x_edges[gx], x_edges[gx + 1]
-                segment_map[y0:y1, x0:x1] = gy * self.grid_size + gx
-        return segment_map
-
     def _predict(self, masked_images):
         images = self._numpy_images_to_tensor(masked_images).to(self.memory_bank.device)
         with torch.no_grad():
-            image_features = self.clip_model.encode_image(images)
-            scores = self._memory_distance_score(image_features, self.memory_bank)
+            if self.patch_memory_bank is not None:
+                patch_tokens = self._encode_patch_tokens(images)
+                scores = self._patch_memory_scores(patch_tokens, self.patch_memory_bank)
+            else:
+                image_features = self.clip_model.encode_image(images)
+                scores = self._memory_distance_score(image_features, self.memory_bank)
         return scores.detach().cpu().numpy().reshape(-1)
 
     def explain(self, image_numpy, n_evals=50):
         """
-        Compute a per-pixel SHAP attribution map.
+        Compute a per-pixel SHAP attribution map with true grid masking.
 
         Parameters
         ----------
         image_numpy : np.ndarray  shape [H, W, 3], uint8 or float32
-        n_evals     : int  number of SHAP model evaluations.
-                      50–100 gives good results on Colab free tier.
-                      200+ gives marginal improvement at 4× the cost.
+        n_evals     : int  target number of model evaluations. At least one
+                      complete grid permutation is evaluated, so total work is
+                      at least grid_size ** 2 + 1 evaluations.
 
         Returns
         -------
         shap_map : np.ndarray  shape [H, W], float32
         """
-        import shap
-
         logger.info(
             "Starting SHAP explanation (n_evals=%d, grid_size=%d)", n_evals, self.grid_size
         )
         image_numpy = self._validate_image_numpy(image_numpy)
+        shap_map = self._permutation_grid_shap(image_numpy, n_evals=n_evals)
 
-        # ------------------------------------------------------------------ #
-        #  Masker choice                                                       #
-        #  "inpaint_telea" — allocates large scratch buffers, slow (~5s/eval) #
-        #  "blur(11,11)"   — fast gaussian fill, low RAM, ~1.5s/eval on T4    #
-        # ------------------------------------------------------------------ #
-        masker = shap.maskers.Image("blur(11,11)", image_numpy.shape)
-        explainer = shap.Explainer(self._predict, masker)
-
-        logger.debug(
-            "Computing SHAP values with %d evaluations over %d features...",
-            n_evals, self.grid_size ** 2,
-        )
-        shap_values = explainer(image_numpy[np.newaxis], max_evals=n_evals)
-        logger.debug("SHAP values computed, shape=%s", shap_values.values.shape)
-
-        shap_map = self._values_to_map(shap_values.values, *image_numpy.shape[:2])
-
-        # Free SHAP internals (can hold large numpy arrays)
-        del shap_values, explainer, masker
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -123,30 +91,64 @@ class PatchSHAPExplainer:
         logger.info("SHAP explanation complete")
         return shap_map.astype(np.float32)
 
-    def _values_to_map(self, values, height, width):
-        values = np.asarray(values)
-        if values.ndim == 4:
-            values = values[0].mean(axis=-1)
-        elif values.ndim == 2:
-            values = values[0]
-        if values.ndim not in (1, 2):
-            raise RuntimeError(f"Unsupported SHAP value shape: {values.shape}")
+    def _permutation_grid_shap(self, image_numpy, n_evals=50):
+        height, width = image_numpy.shape[:2]
+        boxes = self._grid_boxes(height, width)
+        n_features = len(boxes)
+        evals_per_permutation = n_features + 1
+        n_permutations = max(1, int(max(n_evals, evals_per_permutation) // evals_per_permutation))
+        rng = np.random.default_rng(0)
 
+        baseline = self._blur_baseline(image_numpy)
+        patch_values = np.zeros(n_features, dtype=np.float32)
+
+        for _ in range(n_permutations):
+            order = rng.permutation(n_features)
+            sequence = [baseline.copy()]
+            current = baseline.copy()
+            for patch_idx in order:
+                x0, y0, x1, y1 = boxes[patch_idx]
+                current = current.copy()
+                current[y0:y1, x0:x1, :] = image_numpy[y0:y1, x0:x1, :]
+                sequence.append(current)
+
+            scores = self._predict_in_batches(np.stack(sequence, axis=0), batch_size=8)
+            deltas = scores[1:] - scores[:-1]
+            for patch_idx, delta in zip(order, deltas):
+                patch_values[patch_idx] += float(delta)
+
+        patch_values /= float(n_permutations)
+        return self._patch_values_to_map(patch_values, height, width)
+
+    def _predict_in_batches(self, images, batch_size=8):
+        scores = []
+        for start in range(0, len(images), batch_size):
+            scores.append(self._predict(images[start:start + batch_size]))
+        return np.concatenate(scores, axis=0)
+
+    @staticmethod
+    def _blur_baseline(image_numpy):
+        image_u8 = np.clip(image_numpy, 0, 255).astype(np.uint8)
+        blurred = Image.fromarray(image_u8).filter(ImageFilter.GaussianBlur(radius=5))
+        return np.asarray(blurred).astype(np.float32)
+
+    def _patch_values_to_map(self, patch_values, height, width):
         patch_map = np.zeros((height, width), dtype=np.float32)
+        boxes = self._grid_boxes(height, width)
+        for patch_idx, (x0, y0, x1, y1) in enumerate(boxes):
+            patch_map[y0:y1, x0:x1] = patch_values[patch_idx]
+        return patch_map
+
+    def _grid_boxes(self, height, width):
+        boxes = []
         y_edges = np.linspace(0, height, self.grid_size + 1, dtype=int)
         x_edges = np.linspace(0, width, self.grid_size + 1, dtype=int)
-
         for gy in range(self.grid_size):
             for gx in range(self.grid_size):
                 y0, y1 = y_edges[gy], y_edges[gy + 1]
                 x0, x1 = x_edges[gx], x_edges[gx + 1]
-                if values.ndim == 2:
-                    patch_map[y0:y1, x0:x1] = values[y0:y1, x0:x1].mean()
-                else:
-                    patch_idx = gy * self.grid_size + gx
-                    patch_map[y0:y1, x0:x1] = values[patch_idx]
-
-        return patch_map
+                boxes.append((x0, y0, x1, y1))
+        return boxes
 
     @staticmethod
     def _validate_image_numpy(image_numpy):
@@ -183,6 +185,68 @@ class PatchSHAPExplainer:
         nearest = distances.topk(k, dim=1, largest=False).values
         return nearest.mean(dim=1)
 
+    def _encode_patch_tokens(self, images):
+        patch_features = [None]
+        target = getattr(self.clip_model.visual, "ln_post", None)
+        if target is None:
+            raise RuntimeError("CLIP visual ln_post layer is required for patch SHAP scoring")
+
+        def hook(module, inp, out):
+            del module, inp
+            patch_features[0] = self._standardize_patch_features(out)
+
+        handle = target.register_forward_hook(hook)
+        try:
+            global_features = self.clip_model.encode_image(images)
+        finally:
+            handle.remove()
+
+        tokens = patch_features[0]
+        if tokens is None:
+            raise RuntimeError("Patch SHAP scoring could not capture CLIP patch tokens")
+
+        if tokens.shape[-1] != global_features.shape[-1]:
+            proj = getattr(self.clip_model.visual, "proj", None)
+            if proj is not None and tokens.shape[-1] == proj.shape[0]:
+                tokens = tokens @ proj.detach().to(tokens.device)
+
+        return self._drop_cls_token(tokens)
+
+    @staticmethod
+    def _patch_memory_scores(patch_tokens, patch_memory_bank):
+        image_scores = []
+        for image_patches in patch_tokens:
+            patch_scores = compute_patch_scores(
+                image_patches,
+                patch_memory_bank.to(image_patches.device),
+                metric="cosine",
+                top_k=3,
+            )
+            image_scores.append(torch.quantile(patch_scores, 0.95))
+        return torch.stack(image_scores)
+
+    @staticmethod
+    def _standardize_patch_features(out):
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        out = out.detach()
+        if out.dim() == 3 and out.shape[0] > out.shape[1] and out.shape[0] > 32:
+            out = out.permute(1, 0, 2)
+        return out
+
+    @staticmethod
+    def _drop_cls_token(tokens):
+        n_tokens = tokens.shape[1]
+        grid_size = int((n_tokens - 1) ** 0.5)
+        if grid_size * grid_size == n_tokens - 1:
+            return tokens[:, 1:, :]
+
+        grid_size = int(n_tokens ** 0.5)
+        if grid_size * grid_size == n_tokens:
+            return tokens
+
+        raise RuntimeError(f"Token count {n_tokens} is not compatible with a square ViT grid")
+
     @staticmethod
     def _as_memory_tensor(memory_bank, device):
         if isinstance(memory_bank, torch.Tensor):
@@ -195,6 +259,16 @@ class PatchSHAPExplainer:
 
         if memory.numel() == 0:
             raise ValueError("memory_bank is empty; SHAP needs at least one normal reference")
+        return memory.float().to(device)
+
+    @staticmethod
+    def _as_patch_memory_tensor(memory_bank, device):
+        if not hasattr(memory_bank, "get_patch_bank"):
+            return None
+
+        memory = memory_bank.get_patch_bank()
+        if memory.numel() == 0:
+            return None
         return memory.float().to(device)
 
 

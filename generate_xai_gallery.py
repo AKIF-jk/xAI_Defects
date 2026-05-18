@@ -19,16 +19,17 @@ Usage:
 
 Scoring mechanism
 -----------------
-Matches full_evaluation.py few-shot mode exactly:
+The gallery uses one canonical few-shot inference result for each image:
   1. Patch-level cosine distance to memory bank features
   2. Z-score calibration against normal training images (median + MAD)
   3. Baseline subtraction (median of Z-scores)
-  4. Image score = 95th percentile of calibrated patch scores
-  5. Fixed threshold = 0.5 (FR-02 from project spec)
+  4. Patch-level normalization for score-map display
+  5. Image-level normal calibration threshold for the displayed anomaly score
+     (0.5 means the selected normal image-score percentile)
 
 The PromptQueryAdapter is NOT used for scoring (its weights are untrained random).
-Grad-CAM and SHAP use the same memory-distance objective internally, so their
-heatmaps are consistent with the anomaly score.
+Grad-CAM and SHAP use patch-memory objectives, so their heatmaps explain the
+same decision family as the displayed anomaly score.
 
 Other fixes
 -----------
@@ -36,10 +37,9 @@ Other fixes
    matplotlib.colormaps["jet"].
 2. _select_test_images: O(n²) list comprehensions on every loop iteration
    replaced with a simple anomalous_count integer counter.
-3. `import matplotlib.pyplot as mpl_plt` was inside the per-image processing
-   loop. Moved to module-level import at the top of the file.
+3. `import matplotlib.pyplot as mpl_plt` stays at module scope instead of the
+   per-image processing loop.
 4. result["pipe"] popped to avoid holding LLM pipeline reference in result dict.
-5. SHAP column: white grid lines drawn at 7x7 patch boundaries for visibility.
 """
 
 import argparse
@@ -51,11 +51,9 @@ import time
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt          # FIX 7: moved out of per-image loop
 import matplotlib.pyplot as mpl_plt      # alias kept for _render_panel callers
 import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -66,7 +64,7 @@ from model.adaptclip import AdaptCLIPModel
 from model.backbone import load_backbone
 from model.memory_bank import MemoryBank
 from model.score_map import compute_patch_scores, scores_to_heatmap, overlay_heatmap
-from xai.explainer_llm import explain_defect, DEFECT_VOCAB
+from xai.explainer_llm import explain_defect
 from xai.gradcam import CLIPGradCAM
 from xai.shap_explainer import PatchSHAPExplainer
 
@@ -137,11 +135,24 @@ def _extract_patch_features(clip_model, image_tensor):
     return global_feat, patch_feats[0, 1:, :]
 
 
-def _build_patch_calibration(clip_model, calib_loader, patch_memory_tensor, device, normal_percentile=95):
+def _build_patch_calibration(
+    clip_model,
+    calib_loader,
+    patch_memory_tensor,
+    device,
+    map_percentile=99,
+    score_percentile=99,
+    baseline_quantile=0.5,
+):
     """Build Z-score calibration stats from a disjoint set of normal images.
 
     Unlike the memory bank (built from support set), this uses a separate
-    calibration set to avoid overfitting. Returns (center, scale, global_max).
+    calibration set to avoid overfitting.
+
+    Returns:
+      center, scale: per-patch robust Z-score calibration
+      map_global_max: patch-level display scale for heatmaps
+      score_threshold_raw: image-level normal threshold for score calibration
     """
     scores = []
     for images, _ in calib_loader:
@@ -168,25 +179,23 @@ def _build_patch_calibration(clip_model, calib_loader, patch_memory_tensor, devi
     scale_floor = np.percentile(positive_scale, 10) if positive_scale.size else 1e-6
     scale = np.maximum(scale, max(float(scale_floor), 1e-6))
     
-    # Compute global_max for score normalization (matches full_evaluation.py:255)
     all_normal_z = (normal_matrix - center) / scale
     all_normal_z = np.clip(all_normal_z, 0, None)
-    baseline = np.quantile(all_normal_z, 0.5, axis=1, keepdims=True)
+    baseline = np.quantile(all_normal_z, baseline_quantile, axis=1, keepdims=True)
     calibrated = np.clip(all_normal_z - baseline, 0, None)
-    global_max = max(float(np.percentile(calibrated, normal_percentile)), 1.0)
+    map_global_max = max(float(np.percentile(calibrated, map_percentile)), 1e-6)
+
+    normal_image_scores = np.quantile(calibrated, 0.95, axis=1)
+    score_threshold_raw = max(float(np.percentile(normal_image_scores, score_percentile)), 1e-6)
     
-    return center, scale, global_max
+    return center, scale, map_global_max, score_threshold_raw
 
 
-def _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, normal_scale, global_max, baseline_quantile=0.5):
-    """Calibrate patch scores and return image-level anomaly score.
+def _calibrate_patch_scores(query_patches, patch_memory_tensor, normal_center, normal_scale, baseline_quantile=0.5):
+    """Return raw and calibrated patch-memory anomaly scores.
 
-    Matches the few-shot scoring in full_evaluation.py exactly:
-    1. Compute raw cosine distances to memory bank
-    2. Z-score calibrate against normal stats
-    3. Subtract baseline (median of Z-scores)
-    4. Image score = 95th percentile of calibrated patch scores
-    5. Normalize by global_max to [0, 1] range
+    The calibrated scores are the canonical gallery evidence used for score maps
+    and final image-level scores.
     """
     raw_scores = compute_patch_scores(
         query_patches,
@@ -200,22 +209,43 @@ def _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, norm
     z = torch.clamp((raw_scores - center) / scale, min=0.0)
     baseline = torch.quantile(z, baseline_quantile)
     calibrated = torch.clamp(z - baseline, min=0.0)
-
-    # Image-level score: 95th percentile of calibrated patch scores
-    score = float(torch.quantile(calibrated, 0.95).detach().cpu())
-    
-    # Normalize to [0, 1] range (matches full_evaluation.py:297)
-    score = min(score / global_max, 1.0)
-    return score
+    return raw_scores, calibrated
 
 
-def _compute_anomaly_score(
-    image_tensor, clip_model, patch_memory_tensor, normal_center, normal_scale, global_max, device
+def _score_from_calibrated_patches(calibrated_scores, score_threshold_raw):
+    """Return raw image score and normalized display score in [0, 1].
+
+    The fixed gallery threshold of 0.5 maps to the selected normal calibration
+    image-score percentile.
+    """
+    raw_score = float(torch.quantile(calibrated_scores, 0.95).detach().cpu())
+    display_score = min(raw_score / (2.0 * score_threshold_raw), 1.0)
+    return raw_score, display_score
+
+
+def _canonical_gallery_inference(
+    image_tensor,
+    clip_model,
+    patch_memory_tensor,
+    normal_center,
+    normal_scale,
+    map_global_max,
+    score_threshold_raw,
+    device,
+    img_size=IMG_SIZE,
+    baseline_quantile=0.5,
 ):
-    """Full scoring pipeline matching full_evaluation.py few-shot mode.
+    """Compute the canonical gallery decision and visualization evidence.
 
-    Returns a float anomaly score in [0, 1] where higher = more anomalous.
-    Uses calibrated patch-level cosine distances with 95th percentile aggregation.
+    Returns one result object used by the score text, predicted label, score-map
+    overlay, confusion counts, HTML row, and LLM prompt.
+
+    1. Compute raw cosine distances to memory bank
+    2. Z-score calibrate against normal stats
+    3. Subtract baseline (median of Z-scores)
+    4. Score = 95th percentile of calibrated patch scores normalized by the
+       image-level normal calibration threshold
+    5. Score map = calibrated patch scores normalized by map_global_max
     """
     if image_tensor.dim() == 3:
         image_tensor = image_tensor.unsqueeze(0)
@@ -223,30 +253,51 @@ def _compute_anomaly_score(
 
     _, query_patches = _extract_patch_features(clip_model, image_tensor)
     if query_patches is None:
-        return 0.0
+        score_map = np.zeros((img_size, img_size), dtype=np.float32)
+        original_np = _denormalize_image(image_tensor[0])
+        return {
+            "raw_patch_scores": None,
+            "calibrated_patch_scores": None,
+            "raw_image_score": 0.0,
+            "score_map": score_map,
+            "score_overlay": original_np,
+            "anomaly_score": 0.0,
+            "predicted_label": 0,
+        }
 
-    return _calibrate_and_score(query_patches, patch_memory_tensor, normal_center, normal_scale, global_max)
+    raw_scores, calibrated = _calibrate_patch_scores(
+        query_patches,
+        patch_memory_tensor,
+        normal_center,
+        normal_scale,
+        baseline_quantile=baseline_quantile,
+    )
+    raw_image_score, anomaly_score = _score_from_calibrated_patches(
+        calibrated,
+        score_threshold_raw,
+    )
+    predicted_label = 1 if anomaly_score >= ANOMALY_THRESHOLD else 0
 
-
-def _generate_score_map_overlay(image_tensor, clip_model, patch_memory_tensor, img_size=IMG_SIZE):
-    """Generate a score-map heatmap overlay from patch-level anomaly scores.
-
-    Uses direct cosine-similarity distance on patch features (no adapter).
-    """
-    _, query_patches = _extract_patch_features(clip_model, image_tensor)
-    if query_patches is None:
-        return None
-
-    if query_patches.shape[-1] != patch_memory_tensor.shape[-1]:
-        proj = getattr(clip_model.visual, "proj", None)
-        if proj is not None:
-            query_patches = query_patches @ proj.detach().to(query_patches.device)
-
-    scores = compute_patch_scores(query_patches, patch_memory_tensor, metric="cosine", top_k=3)
-    heatmap = scores_to_heatmap(scores, img_size=img_size, patch_size=14, sigma=4.0)
+    heatmap = scores_to_heatmap(
+        calibrated,
+        img_size=img_size,
+        patch_size=14,
+        sigma=12.0,
+        global_max=map_global_max,
+    )
+    score_map = heatmap.squeeze().detach().cpu().numpy().astype(np.float32)
     original_np = _denormalize_image(image_tensor[0])
-    overlay = overlay_heatmap(original_np, heatmap.cpu().numpy(), alpha=0.5)
-    return overlay
+    score_overlay = overlay_heatmap(original_np, score_map, alpha=0.5)
+
+    return {
+        "raw_patch_scores": raw_scores.detach().cpu(),
+        "calibrated_patch_scores": calibrated.detach().cpu(),
+        "raw_image_score": raw_image_score,
+        "score_map": score_map,
+        "score_overlay": score_overlay,
+        "anomaly_score": anomaly_score,
+        "predicted_label": predicted_label,
+    }
 
 
 def _normalize_map_for_display(map_2d):
@@ -598,12 +649,13 @@ def generate_gallery(
         calib_indices = list(range(n_shots, len(train_ds)))
         calib_subset = torch.utils.data.Subset(train_ds, calib_indices)
         calib_loader = DataLoader(calib_subset, batch_size=1, shuffle=False)
-        normal_center, normal_scale, global_max = _build_patch_calibration(
+        normal_center, normal_scale, map_global_max, score_threshold_raw = _build_patch_calibration(
             clip_model, calib_loader, patch_memory_tensor, device
         )
         logger.info(
-            "Patch calibration built for %s (calibration set: %d images, global_max=%.4f)",
-            cat, len(calib_indices), global_max
+            "Patch calibration built for %s "
+            "(calibration set: %d images, map_global_max=%.4f, score_threshold_raw=%.4f)",
+            cat, len(calib_indices), map_global_max, score_threshold_raw
         )
 
         # Load test set
@@ -633,6 +685,21 @@ def generate_gallery(
             )
 
             try:
+                canonical = _canonical_gallery_inference(
+                    image_tensor,
+                    clip_model,
+                    patch_memory_tensor,
+                    normal_center,
+                    normal_scale,
+                    map_global_max,
+                    score_threshold_raw,
+                    device,
+                    IMG_SIZE,
+                )
+                anomaly_score = canonical["anomaly_score"]
+                predicted_label = canonical["predicted_label"]
+                score_overlay = canonical["score_overlay"]
+
                 result = explain_defect(
                     image_tensor, adapt_model, memory, cat,
                     pipe=pipe,
@@ -642,23 +709,16 @@ def generate_gallery(
                     n_evals=n_evals,
                     llm_model=llm_model,
                     use_4bit=use_4bit,
+                    score_override=anomaly_score,
+                    gradcam_score_mode="patch",
                 )
                 pipe = result.pop("pipe")
                 gradcam_map = result["gradcam_map"]
                 shap_map = result["shap_map"]
                 explanation = result["explanation"]
-
-                # Scoring: calibrated patch-level cosine distance (matches full_evaluation.py few-shot)
-                anomaly_score = _compute_anomaly_score(
-                    image_tensor, clip_model, patch_memory_tensor,
-                    normal_center, normal_scale, global_max, device,
-                )
             except Exception as e:
                 logger.error("Failed on %s idx %d: %s", cat, ds_idx, e)
                 continue
-
-            # FR-02: fixed 0.5 threshold from project spec
-            predicted_label = 1 if anomaly_score >= ANOMALY_THRESHOLD else 0
 
             # Update confusion counts
             if true_label == 1 and predicted_label == 1:
@@ -669,11 +729,6 @@ def generate_gallery(
                 fn += 1
             else:
                 fp += 1
-
-            # Generate score map overlay (uses direct patch-cosine distance, no adapter)
-            score_overlay = _generate_score_map_overlay(
-                image_tensor, clip_model, patch_memory_tensor, IMG_SIZE
-            )
 
             # Denormalize original
             original_np = _denormalize_image(image_tensor[0])
