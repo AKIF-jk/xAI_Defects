@@ -640,7 +640,7 @@ def generate_gallery(
         # Build memory bank from support set (first n_shots images)
         train_ds = MVTecDataset(data_dir, cat, split="train", transform=transform)
         train_loader = DataLoader(train_ds, batch_size=1, shuffle=False)
-        memory = MemoryBank(feat_dim=768, mode="global")
+        memory = MemoryBank(feat_dim=768, mode="hybrid")
         memory.build(clip_model, train_loader, n_shots, device)
         patch_memory_tensor = memory.get_patch_bank().to(device)
         logger.info("Memory bank: %d vectors for %s (support set: first %d images)", memory.size, cat, n_shots)
