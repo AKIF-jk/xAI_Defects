@@ -94,6 +94,19 @@ def _denormalize_image(tensor):
     return (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
 
+def _normal_case_explanation(predicted_label, anomaly_score):
+    """Return a non-defect explanation string for normal-labeled samples."""
+    if predicted_label == 0:
+        return (
+            f"No visible defect detected; this sample appears normal "
+            f"(score={anomaly_score:.2f})."
+        )
+    return (
+        f"Ground truth is normal, but the model flagged a potential anomaly "
+        f"(score={anomaly_score:.2f}); likely a false positive."
+    )
+
+
 def _extract_patch_features(clip_model, image_tensor):
     """Extract global feature and patch tokens from CLIP visual encoder.
 
@@ -715,7 +728,10 @@ def generate_gallery(
                 pipe = result.pop("pipe")
                 gradcam_map = result["gradcam_map"]
                 shap_map = result["shap_map"]
-                explanation = result["explanation"]
+                if true_label == 0:
+                    explanation = _normal_case_explanation(predicted_label, anomaly_score)
+                else:
+                    explanation = result["explanation"]
             except Exception as e:
                 logger.error("Failed on %s idx %d: %s", cat, ds_idx, e)
                 continue
