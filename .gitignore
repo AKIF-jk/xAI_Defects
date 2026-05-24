@@ -15,3 +15,4 @@ env/
 *.swo
 *~
 src/data/results
+results

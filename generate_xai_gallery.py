@@ -76,7 +76,7 @@ CATEGORIES = [
     "tile", "toothbrush", "transistor", "wood", "zipper",
 ]
 
-ANOMALY_THRESHOLD = 0.5
+ANOMALY_THRESHOLD = 0.4
 
 IMG_SIZE = 224
 
