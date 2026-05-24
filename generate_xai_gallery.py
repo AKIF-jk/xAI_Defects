@@ -15,7 +15,7 @@ Outputs:
   outputs/results/xai_gallery.html              (summary HTML, sortable, color-coded)
 
 Usage:
-  python generate_xai_gallery.py --data_dir /path/to/mvtec_anomaly_detection
+  python generate_xai_gallery.py --data_dir /path/to/mvtec_anomaly_detection --threshold 0.4
 
 Scoring mechanism
 -----------------
@@ -24,8 +24,9 @@ The gallery uses one canonical few-shot inference result for each image:
   2. Z-score calibration against normal training images (median + MAD)
   3. Baseline subtraction (median of Z-scores)
   4. Patch-level normalization for score-map display
-  5. Image-level normal calibration threshold for the displayed anomaly score
-     (0.5 means the selected normal image-score percentile)
+  5. Image-level normal calibration threshold for the displayed anomaly score.
+     Score scaling maps the selected normal percentile to 0.5; the gallery
+     decision threshold is configurable and defaults to 0.4 for better recall.
 
 The PromptQueryAdapter is NOT used for scoring (its weights are untrained random).
 Grad-CAM and SHAP use patch-memory objectives, so their heatmaps explain the
@@ -44,6 +45,7 @@ Other fixes
 
 import argparse
 import gc
+import html
 import logging
 import os
 import sys
@@ -64,7 +66,6 @@ from model.adaptclip import AdaptCLIPModel
 from model.backbone import load_backbone
 from model.memory_bank import MemoryBank
 from model.score_map import compute_patch_scores, scores_to_heatmap, overlay_heatmap
-from xai.explainer_llm import explain_defect
 from xai.gradcam import CLIPGradCAM
 from xai.shap_explainer import PatchSHAPExplainer
 
@@ -76,7 +77,7 @@ CATEGORIES = [
     "tile", "toothbrush", "transistor", "wood", "zipper",
 ]
 
-ANOMALY_THRESHOLD = 0.4
+DEFAULT_ANOMALY_THRESHOLD = 0.4
 
 IMG_SIZE = 224
 
@@ -94,16 +95,25 @@ def _denormalize_image(tensor):
     return (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
 
 
-def _normal_case_explanation(predicted_label, anomaly_score):
-    """Return a non-defect explanation string for normal-labeled samples."""
+def _normal_case_explanation(
+    predicted_label,
+    anomaly_score,
+    threshold,
+    shap_region=None,
+    gradcam_region=None,
+):
+    """Return a bounded explanation string for normal-labeled samples."""
     if predicted_label == 0:
         return (
-            f"No visible defect detected; this sample appears normal "
-            f"(score={anomaly_score:.2f})."
+            f"No labeled defect; score {anomaly_score:.2f} is below "
+            f"threshold {threshold:.2f}, so this sample is treated as normal."
         )
+
+    evidence = _evidence_phrase(shap_region, gradcam_region)
     return (
-        f"Ground truth is normal, but the model flagged a potential anomaly "
-        f"(score={anomaly_score:.2f}); likely a false positive."
+        f"No labeled defect, but score {anomaly_score:.2f} exceeds "
+        f"threshold {threshold:.2f}; {evidence}, suggesting normal variation "
+        f"or a false alarm."
     )
 
 
@@ -228,8 +238,8 @@ def _calibrate_patch_scores(query_patches, patch_memory_tensor, normal_center, n
 def _score_from_calibrated_patches(calibrated_scores, score_threshold_raw):
     """Return raw image score and normalized display score in [0, 1].
 
-    The fixed gallery threshold of 0.5 maps to the selected normal calibration
-    image-score percentile.
+    The display scale maps the selected normal calibration percentile to 0.5.
+    The actual anomalous/normal decision threshold is configurable.
     """
     raw_score = float(torch.quantile(calibrated_scores, 0.95).detach().cpu())
     display_score = min(raw_score / (2.0 * score_threshold_raw), 1.0)
@@ -247,6 +257,7 @@ def _canonical_gallery_inference(
     device,
     img_size=IMG_SIZE,
     baseline_quantile=0.5,
+    threshold=DEFAULT_ANOMALY_THRESHOLD,
 ):
     """Compute the canonical gallery decision and visualization evidence.
 
@@ -289,7 +300,7 @@ def _canonical_gallery_inference(
         calibrated,
         score_threshold_raw,
     )
-    predicted_label = 1 if anomaly_score >= ANOMALY_THRESHOLD else 0
+    predicted_label = 1 if anomaly_score >= threshold else 0
 
     heatmap = scores_to_heatmap(
         calibrated,
@@ -323,12 +334,171 @@ def _normalize_map_for_display(map_2d):
     return np.zeros_like(positive)
 
 
+def _status_from_labels(true_label, predicted_label):
+    """Return confusion status from binary ground truth and prediction."""
+    if true_label == 1 and predicted_label == 1:
+        return "TP"
+    if true_label == 0 and predicted_label == 0:
+        return "TN"
+    if true_label == 1 and predicted_label == 0:
+        return "FN"
+    return "FP"
+
+
+def _confusion_summary_from_panels(panels):
+    summary = {"TP": 0, "FP": 0, "TN": 0, "FN": 0}
+    for panel in panels:
+        status = _status_from_labels(panel["true_label"], panel["predicted_label"])
+        summary[status] += 1
+    return summary
+
+
+def _position_from_grid_index(patch_idx, grid_size):
+    G = max(1, int(grid_size))
+    row = int(patch_idx) // G
+    col = int(patch_idx) % G
+
+    upper_cut = G / 3.0
+    lower_cut = 2.0 * G / 3.0
+    vertical = "upper" if row < upper_cut else ("lower" if row >= lower_cut else "middle")
+    horizontal = "left" if col < upper_cut else ("right" if col >= lower_cut else "center")
+
+    if vertical == "middle" and horizontal == "center":
+        return "center"
+    if vertical == "middle":
+        return horizontal
+    if horizontal == "center":
+        return vertical
+    return f"{vertical}-{horizontal}"
+
+
+def _strongest_map_region(map_2d, grid_size, positive_only=True):
+    """Return the strongest coarse grid region in a map, or None if unfocused."""
+    m = np.asarray(map_2d, dtype=np.float32)
+    if m.ndim != 2 or m.size == 0:
+        return None
+
+    G = max(1, int(grid_size))
+    h, w = m.shape
+    y_edges = np.linspace(0, h, G + 1, dtype=int)
+    x_edges = np.linspace(0, w, G + 1, dtype=int)
+
+    best_idx = None
+    best_val = -float("inf")
+    for gy in range(G):
+        for gx in range(G):
+            patch = m[y_edges[gy]: y_edges[gy + 1], x_edges[gx]: x_edges[gx + 1]]
+            if patch.size == 0:
+                continue
+            val = float(patch.mean())
+            if positive_only and val <= 0.0:
+                continue
+            if val > best_val:
+                best_val = val
+                best_idx = gy * G + gx
+
+    if best_idx is None or best_val <= 1e-8:
+        return None
+    return _position_from_grid_index(best_idx, G)
+
+
+def _evidence_phrase(shap_region, gradcam_region):
+    parts = []
+    if shap_region:
+        parts.append(f"SHAP highlights the {shap_region}")
+    if gradcam_region:
+        parts.append(f"Grad-CAM peaks in the {gradcam_region}")
+    return " and ".join(parts) if parts else "XAI maps show no focused region"
+
+
+def _humanize_defect(defect_type):
+    return str(defect_type).replace("_", " ").strip() or "defect"
+
+
+def _severity_label(anomaly_score, threshold):
+    if anomaly_score >= 0.75:
+        return "high"
+    if anomaly_score >= threshold:
+        return "moderate"
+    return "low"
+
+
+def _plausible_cause(defect_type):
+    """Return a controlled cause phrase keyed by known MVTec defect labels."""
+    defect = str(defect_type).lower()
+    rules = [
+        (("crack", "broken", "hole", "poke"), "impact or material stress"),
+        (("scratch", "cut", "rough"), "abrasion or handling wear"),
+        (("contamination", "glue", "oil", "liquid", "color", "gray", "print", "imprint"),
+         "process residue or surface-treatment variation"),
+        (("bent", "misplaced", "flip", "squeeze", "manipulated", "cable_swap", "missing"),
+         "assembly alignment or handling variation"),
+        (("thread", "fabric", "teeth"), "local material or weave irregularity"),
+    ]
+    for keywords, cause in rules:
+        if any(keyword in defect for keyword in keywords):
+            return cause
+    return "localized manufacturing variation"
+
+
+def _build_deterministic_explanation(
+    category,
+    defect_type,
+    anomaly_score,
+    threshold,
+    gradcam_map,
+    shap_map,
+    grid_size,
+    predicted_label,
+):
+    """Build a constrained gallery explanation from measured XAI evidence."""
+    shap_region = _strongest_map_region(shap_map, grid_size, positive_only=True)
+    gradcam_region = _strongest_map_region(gradcam_map, grid_size, positive_only=False)
+
+    if defect_type == "good":
+        return _normal_case_explanation(
+            predicted_label,
+            anomaly_score,
+            threshold,
+            shap_region=shap_region,
+            gradcam_region=gradcam_region,
+        )
+
+    defect = _humanize_defect(defect_type)
+    evidence = _evidence_phrase(shap_region, gradcam_region)
+
+    if predicted_label == 0:
+        return (
+            f"Low evidence (score {anomaly_score:.2f}) for labeled {defect} in "
+            f"the {category}; score is below threshold {threshold:.2f}, while "
+            f"{evidence}."
+        )
+
+    severity = _severity_label(anomaly_score, threshold)
+    cause = _plausible_cause(defect_type)
+    return (
+        f"{severity.capitalize()} evidence (score {anomaly_score:.2f}) for {defect} "
+        f"in the {category}: {evidence}, consistent with {cause}."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Panel rendering
 # ---------------------------------------------------------------------------
 
-def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation,
-                  anomaly_score, true_label, predicted_label, defect_type=""):
+def _render_panel(
+    original_np,
+    score_overlay,
+    gradcam_map,
+    shap_map,
+    explanation,
+    anomaly_score,
+    true_label,
+    predicted_label,
+    defect_type="",
+    threshold=DEFAULT_ANOMALY_THRESHOLD,
+    grid_size=None,
+):
     """Render a single panel as a matplotlib figure: 1x4 grid + text."""
     fig, axes = mpl_plt.subplots(1, 4, figsize=(16, 4))
 
@@ -356,25 +526,21 @@ def _render_panel(original_np, score_overlay, gradcam_map, shap_map, explanation
     axes[2].set_title("Grad-CAM", fontsize=10)
     axes[2].axis("off")
 
-    # SHAP Overlay with visible 7x7 grid lines
     shap_display = _normalize_map_for_display(shap_map)
     shap_colored = jet(shap_display)[:, :, :3]
     shap_overlay = (0.5 * original_np.astype(np.float32) / 255.0 + 0.5 * shap_colored)
     shap_overlay = np.clip(shap_overlay, 0, 1)
     axes[3].imshow(shap_overlay)
-    axes[3].set_title("SHAP (7x7 fast)", fontsize=10)
+    grid_label = f"{grid_size}x{grid_size}" if grid_size else "grid"
+    axes[3].set_title(f"SHAP ({grid_label})", fontsize=10)
     axes[3].axis("off")
 
     # Explanation text below
-    status = (
-        "TP" if (true_label == 1 and anomaly_score >= ANOMALY_THRESHOLD) else
-        "TN" if (true_label == 0 and anomaly_score < ANOMALY_THRESHOLD) else
-        "FN" if (true_label == 1 and anomaly_score < ANOMALY_THRESHOLD) else "FP"
-    )
+    status = _status_from_labels(true_label, predicted_label)
 
     text_str = (
         f"Category: {defect_type or 'N/A'}  |  "
-        f"Anomaly Score: {anomaly_score:.4f}  |  "
+        f"Anomaly Score: {anomaly_score:.4f}  |  Threshold: {threshold:.2f}  |  "
         f"True: {'Anomalous' if true_label == 1 else 'Normal'}  |  "
         f"Predicted: {'Anomalous' if predicted_label == 1 else 'Normal'}  |  "
         f"Status: {status}\n"
@@ -434,14 +600,22 @@ def _select_test_images(test_ds, category, max_anomalous=4, max_normal=1):
 
 
 # ---------------------------------------------------------------------------
-# HTML generation (unchanged)
+# HTML generation
 # ---------------------------------------------------------------------------
 
-def _generate_html(all_panels, html_path, heatmap_dir):
+def _generate_html(all_panels, html_path, heatmap_dir, threshold):
     """
     Generate a summary HTML file with embedded images, color-coded status,
     sortable by category and anomaly score.
     """
+    del heatmap_dir
+
+    summary = _confusion_summary_from_panels(all_panels)
+    total = sum(summary.values())
+    accuracy = (summary["TP"] + summary["TN"]) / total if total else 0.0
+    recall = summary["TP"] / (summary["TP"] + summary["FN"]) if (summary["TP"] + summary["FN"]) else 0.0
+    precision = summary["TP"] / (summary["TP"] + summary["FP"]) if (summary["TP"] + summary["FP"]) else 0.0
+
     rows_html = []
     for panel in all_panels:
         cat = panel["category"]
@@ -452,35 +626,34 @@ def _generate_html(all_panels, html_path, heatmap_dir):
         defect_type = panel["defect_type"]
         img_path = panel["img_path"]
 
-        # Status is already determined by predicted_label (computed with per-cat threshold)
-        if true_label == 1 and predicted_label == 1:
-            status = "TP"
+        status = _status_from_labels(true_label, predicted_label)
+        if status == "TP":
             row_color = "#e6ffe6"
-        elif true_label == 0 and predicted_label == 0:
-            status = "TN"
+        elif status == "TN":
             row_color = "#e6f0ff"
-        elif true_label == 1 and predicted_label == 0:
-            status = "FN"
+        elif status == "FN":
             row_color = "#ffe6e6"
         else:
-            status = "FP"
             row_color = "#fff3e0"
 
         true_str = "Anomalous" if true_label == 1 else "Normal"
         pred_str = "Anomalous" if predicted_label == 1 else "Normal"
 
-        rel_img = os.path.relpath(img_path, os.path.dirname(html_path))
+        rel_img = html.escape(os.path.relpath(img_path, os.path.dirname(html_path)), quote=True)
+        cat_html = html.escape(cat, quote=True)
+        defect_html = html.escape(defect_type)
+        explanation_html = html.escape(explanation)
 
         rows_html.append(f"""
-        <tr style="background-color:{row_color}" data-score="{score:.4f}" data-category="{cat}" data-status="{status}">
+        <tr style="background-color:{row_color}" data-score="{score:.4f}" data-category="{cat_html}" data-status="{status}">
             <td><img src="{rel_img}" width="320" loading="lazy"></td>
-            <td>{cat}</td>
-            <td>{defect_type}</td>
+            <td>{cat_html}</td>
+            <td>{defect_html}</td>
             <td>{score:.4f}</td>
             <td>{true_str}</td>
             <td>{pred_str}</td>
             <td><strong>{status}</strong></td>
-            <td style="max-width:300px;font-size:12px;">{explanation}</td>
+            <td style="max-width:340px;font-size:12px;">{explanation_html}</td>
         </tr>""")
 
     rows_str = "\n".join(rows_html)
@@ -490,7 +663,7 @@ def _generate_html(all_panels, html_path, heatmap_dir):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>XAI Gallery — MVTec AD</title>
+<title>XAI Gallery - MVTec AD</title>
 <style>
   body {{ font-family: monospace; margin: 20px; background: #fafafa; }}
   h1 {{ color: #333; }}
@@ -498,6 +671,8 @@ def _generate_html(all_panels, html_path, heatmap_dir):
   th {{ background: #333; color: #fff; padding: 8px; position: sticky; top: 0; cursor: pointer; }}
   th:hover {{ background: #555; }}
   td {{ padding: 8px; border-bottom: 1px solid #ddd; vertical-align: top; }}
+  .summary {{ background: #fff; border: 1px solid #ddd; padding: 10px 12px; margin-bottom: 15px; }}
+  .summary span {{ display: inline-block; margin-right: 18px; }}
   .controls {{ margin-bottom: 15px; }}
   .controls select, .controls button {{ padding: 6px 12px; margin-right: 8px; font-family: monospace; }}
   .legend {{ margin-bottom: 15px; font-size: 13px; }}
@@ -506,6 +681,18 @@ def _generate_html(all_panels, html_path, heatmap_dir):
 </head>
 <body>
 <h1>XAI Defect Inspection Gallery</h1>
+
+<div class="summary">
+  <div><strong>Decision threshold:</strong> score &gt;= {threshold:.2f} is anomalous.</div>
+  <span>Total: {total}</span>
+  <span>TP: {summary['TP']}</span>
+  <span>FN: {summary['FN']}</span>
+  <span>TN: {summary['TN']}</span>
+  <span>FP: {summary['FP']}</span>
+  <span>Accuracy: {accuracy:.3f}</span>
+  <span>Recall: {recall:.3f}</span>
+  <span>Precision: {precision:.3f}</span>
+</div>
 
 <div class="legend">
   <span style="background:#e6ffe6;">TP: Correctly detected anomaly</span>
@@ -518,7 +705,7 @@ def _generate_html(all_panels, html_path, heatmap_dir):
   <label>Filter by category:
     <select id="catFilter" onchange="filterTable()">
       <option value="all">All</option>
-      {" ".join(f'<option value="{c}">{c}</option>' for c in CATEGORIES)}
+      {" ".join(f'<option value="{html.escape(c, quote=True)}">{html.escape(c)}</option>' for c in CATEGORIES)}
     </select>
   </label>
   <label>Filter by status:
@@ -617,8 +804,11 @@ def generate_gallery(
     use_4bit=False,
     max_anomalous=5,
     max_normal=1,
+    threshold=DEFAULT_ANOMALY_THRESHOLD,
 ):
     """Generate the full XAI gallery across all 15 MVTec AD categories."""
+    threshold = float(threshold)
+    logger.info("Gallery decision threshold: %.4f", threshold)
 
     # Load backbone and model
     clip_model, _, _, device = load_backbone(device)
@@ -642,8 +832,6 @@ def generate_gallery(
 
     all_panels = []
     tp, fp, tn, fn = 0, 0, 0, 0
-    pipe = None
-
     for cat_idx, cat in enumerate(CATEGORIES):
         logger.info("=" * 60)
         logger.info("Category %d/%d: %s", cat_idx + 1, len(CATEGORIES), cat)
@@ -708,52 +896,52 @@ def generate_gallery(
                     score_threshold_raw,
                     device,
                     IMG_SIZE,
+                    threshold=threshold,
                 )
                 anomaly_score = canonical["anomaly_score"]
                 predicted_label = canonical["predicted_label"]
                 score_overlay = canonical["score_overlay"]
 
-                result = explain_defect(
-                    image_tensor, adapt_model, memory, cat,
-                    pipe=pipe,
-                    gradcam_gen=gradcam_gen,
-                    shap_gen=shap_gen,
-                    grid_size=grid_size,
-                    n_evals=n_evals,
-                    llm_model=llm_model,
-                    use_4bit=use_4bit,
-                    score_override=anomaly_score,
-                    gradcam_score_mode="patch",
+                image_batch = image_tensor if image_tensor.dim() == 4 else image_tensor.unsqueeze(0)
+                original_np = _denormalize_image(image_batch[0])
+                gradcam_map = gradcam_gen.generate(
+                    image_batch,
+                    memory,
+                    cat,
+                    img_size=IMG_SIZE,
+                    score_mode="patch",
                 )
-                pipe = result.pop("pipe")
-                gradcam_map = result["gradcam_map"]
-                shap_map = result["shap_map"]
-                if true_label == 0:
-                    explanation = _normal_case_explanation(predicted_label, anomaly_score)
-                else:
-                    explanation = result["explanation"]
+                shap_map = shap_gen.explain(original_np, n_evals=n_evals)
+                explanation = _build_deterministic_explanation(
+                    cat,
+                    defect_type,
+                    anomaly_score,
+                    threshold,
+                    gradcam_map,
+                    shap_map,
+                    grid_size,
+                    predicted_label,
+                )
             except Exception as e:
                 logger.error("Failed on %s idx %d: %s", cat, ds_idx, e)
                 continue
 
-            # Update confusion counts
-            if true_label == 1 and predicted_label == 1:
+            # Update confusion counts using the same thresholded prediction shown in the panel.
+            status = _status_from_labels(true_label, predicted_label)
+            if status == "TP":
                 tp += 1
-            elif true_label == 0 and predicted_label == 0:
+            elif status == "TN":
                 tn += 1
-            elif true_label == 1 and predicted_label == 0:
+            elif status == "FN":
                 fn += 1
             else:
                 fp += 1
-
-            # Denormalize original
-            original_np = _denormalize_image(image_tensor[0])
 
             # Render panel figure
             fig = _render_panel(
                 original_np, score_overlay, gradcam_map, shap_map,
                 explanation, anomaly_score, true_label, predicted_label,
-                defect_type=defect_type,
+                defect_type=defect_type, threshold=threshold, grid_size=grid_size,
             )
 
             # Save panel as individual PNG (for HTML embedding)
@@ -795,12 +983,12 @@ def generate_gallery(
 
     # Generate summary HTML
     html_path = os.path.join(output_results_dir, "xai_gallery.html")
-    _generate_html(all_panels, html_path, output_heatmap_dir)
+    _generate_html(all_panels, html_path, output_heatmap_dir, threshold)
 
     # Print confusion summary
     total = tp + fp + tn + fn
     print("\n" + "=" * 60)
-    print("CONFUSION SUMMARY (threshold = {:.1f}, FR-02 spec)".format(ANOMALY_THRESHOLD))
+    print("CONFUSION SUMMARY (threshold = {:.2f})".format(threshold))
     print("=" * 60)
     print(f"  True Positives  (TP): {tp}")
     print(f"  False Positives (FP): {fp}")
@@ -855,12 +1043,15 @@ def main():
     parser.add_argument("--output_heatmap_dir", default="./outputs/heatmaps")
     parser.add_argument("--output_results_dir", default="./outputs/results")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--threshold", type=float, default=DEFAULT_ANOMALY_THRESHOLD,
+                        help="Anomaly decision threshold; scores >= threshold are anomalous")
     parser.add_argument("--n_shots", type=int, default=32, help="Normal shots for memory bank")
-    parser.add_argument("--grid_size", type=int, default=13, help="SHAP patch grid (7x7 fast mode)")
+    parser.add_argument("--grid_size", type=int, default=13, help="SHAP patch grid size")
     parser.add_argument("--n_evals", type=int, default=200, help="SHAP evaluations per image")
     parser.add_argument("--llm_model", default="Qwen/Qwen2.5-0.5B-Instruct",
-                        help="HuggingFace LLM for explanations")
-    parser.add_argument("--use_4bit", action="store_true", help="4-bit LLM quantization")
+                        help="Reserved for optional LLM rewriting; gallery explanations are deterministic")
+    parser.add_argument("--use_4bit", action="store_true",
+                        help="Reserved for optional LLM rewriting; deterministic gallery does not load an LLM")
     parser.add_argument("--max_anomalous", type=int, default=5,
                         help="Max anomalous images per category")
     parser.add_argument("--max_normal", type=int, default=1,
@@ -884,6 +1075,7 @@ def main():
         use_4bit=args.use_4bit,
         max_anomalous=args.max_anomalous,
         max_normal=args.max_normal,
+        threshold=args.threshold,
     )
 
 
