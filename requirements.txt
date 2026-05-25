@@ -1,2 +1,2 @@
-gradio>=4.44,<6
+gradio>=4.44
 pillow>=10,<12
