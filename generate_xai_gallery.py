@@ -46,6 +46,7 @@ Other fixes
 import argparse
 import gc
 import html
+import json
 import logging
 import os
 import sys
@@ -832,7 +833,12 @@ def generate_gallery(
 
     all_panels = []
     tp, fp, tn, fn = 0, 0, 0, 0
+    per_category = {}
+    cat_timing = {}
+    total_start = time.perf_counter()
     for cat_idx, cat in enumerate(CATEGORIES):
+        per_category[cat] = {"TP": 0, "FP": 0, "TN": 0, "FN": 0}
+        cat_timing[cat] = 0.0
         logger.info("=" * 60)
         logger.info("Category %d/%d: %s", cat_idx + 1, len(CATEGORIES), cat)
         logger.info("=" * 60)
@@ -928,6 +934,7 @@ def generate_gallery(
 
             # Update confusion counts using the same thresholded prediction shown in the panel.
             status = _status_from_labels(true_label, predicted_label)
+            per_category[cat][status] += 1
             if status == "TP":
                 tp += 1
             elif status == "TN":
@@ -979,6 +986,7 @@ def generate_gallery(
             torch.cuda.empty_cache()
 
         cat_elapsed = time.perf_counter() - cat_start
+        cat_timing[cat] = round(cat_elapsed, 2)
         logger.info("Category %s complete in %.1fs", cat, cat_elapsed)
 
     # Generate summary HTML
@@ -995,13 +1003,39 @@ def generate_gallery(
     print(f"  True Negatives  (TN): {tn}")
     print(f"  False Negatives (FN): {fn}")
     print(f"  Total images:         {total}")
+    accuracy = float((tp + tn) / total) if total > 0 else 0.0
+    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
     if total > 0:
-        print(f"  Accuracy:             {(tp + tn) / total:.4f}")
+        print(f"  Accuracy:             {accuracy:.4f}")
         if (tp + fn) > 0:
-            print(f"  Recall (TPR):         {tp / (tp + fn):.4f}")
+            print(f"  Recall (TPR):         {recall:.4f}")
         if (tp + fp) > 0:
-            print(f"  Precision:            {tp / (tp + fp):.4f}")
+            print(f"  Precision:            {precision:.4f}")
     print("=" * 60)
+
+    total_elapsed = time.perf_counter() - total_start
+
+    # Save metrics JSON
+    metrics = {
+        "threshold": threshold,
+        "total": total,
+        "TP": tp,
+        "FP": fp,
+        "TN": tn,
+        "FN": fn,
+        "accuracy": accuracy,
+        "recall": recall,
+        "precision": precision,
+        "total_time_seconds": round(total_elapsed, 2),
+        "per_category": per_category,
+        "per_category_time_seconds": cat_timing,
+    }
+    json_path = os.path.join(output_results_dir, "metrics.json")
+    os.makedirs(output_results_dir, exist_ok=True)
+    with open(json_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    logger.info("Metrics saved to %s", json_path)
 
     return all_panels
 
